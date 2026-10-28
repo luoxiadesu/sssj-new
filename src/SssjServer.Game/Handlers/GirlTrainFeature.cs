@@ -106,20 +106,48 @@ public sealed class GirlTrainFeature : IGameFeature
     public const int ErrGeneric = 1;
 
     private GameFeatureContext _ctx = null!;
+    private PledgeTable _pledge = PledgeTable.Empty;
+    private GirlMoodRecovery _mood = null!;
     private TrainTable _train = TrainTable.Empty;
+    private HouseTable _trainHouse = HouseTable.Empty;
+    private readonly HashSet<string> _trainThemes = new();
+    private GirlLoveTable _headTouchLove = GirlLoveTable.Empty;
+    private CafeTable _trainCafe = CafeTable.Empty;
+    private MissionTable _headTouchMissions = MissionTable.Empty;
+    internal const int HeadTouchLoveReward = 50;
 
     public string Name => "少女养成/特训（sFunction GirlLogic）";
 
     public void Install(GameFeatureContext ctx)
     {
         _ctx = ctx;
+        _pledge = PledgeTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
+        _mood = new GirlMoodRecovery(Path.GetFullPath(ctx.Options.SettingDirectory));
         _train = TrainTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
+        _trainHouse = HouseTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
+        var sorts = SettingTable.Load(Path.Combine(ctx.Options.SettingDirectory, "NCafeSort.txt"));
+        if (sorts is not null)
+            foreach (var sort in sorts.Rows)
+            {
+                var ignored = sorts.Str(sort, "EditorIgnore").Trim('[', ']').Split(',');
+                // This restoration runs the Chinese client (GetLangType() == 1).
+                if (!ignored.Any(v => v.Trim() is "1" or "-1"))
+                    _trainThemes.Add(sorts.Str(sort, "Type"));
+            }
+        _headTouchLove = GirlLoveTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
+        _trainCafe = CafeTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
+        _headTouchMissions = MissionTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
         // ★ 本域持有 sFunction=GirlLogic 的**主 handler**。同一个 sFunction 还被
         // GirlLoveFeature（好感度/剧情）瓜分，它走 ctx.AddFunctionCoHandler 追加子命令
         // ——「协处理器先跑、都不认才落到这里」，所以下面 Unknown 的告警仍然可信。
         // ★★ 两边都用 MapFunction 会互相覆盖（后装配者把前者整域吃掉），
         //    见 LuaCallRouter.AddFunctionCoHandler 的注释。
         ctx.MapFunction(Function, OnCommand);
+        ctx.OnPlayerPrepare((session, player) =>
+        {
+            if (RefreshHeadTouches(player, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
+                ctx.Store.Save(player);
+        });
     }
 
     private Task OnCommand(ClientSession session, string function, JsonNode? param)
@@ -128,7 +156,7 @@ public sealed class GirlTrainFeature : IGameFeature
             return Task.CompletedTask;
 
         string sCmd = param?["sCmd"]?.ToString() ?? "";
-        return sCmd switch
+        lock (player) return sCmd switch
         {
             CmdAddTrainPos => OnAddTrainPos(session, player),
             CmdStartTrain => OnStartTrain(session, player, param),
@@ -239,16 +267,35 @@ public sealed class GirlTrainFeature : IGameFeature
             return false;
         }
 
-        var row = _train.TrainingFor(slot.OutdoorId, slot.Type);
-        int seconds = row?.Time > 0 ? row.Time : TrainTable.FallbackSeconds;
+        int outdoorId = CurrentOutdoor(player, _trainHouse);
+        var row = _train.TrainingFor(outdoorId, slot.Type);
+        int cafeLevel = CafeFeature.ReadState(player, _trainCafe).Level;
+        int capacity = _trainCafe.LevelRowFor(cafeLevel)?.OpenTrain ?? 0;
+        var active = player.Girls.Where(g => GetVar(player, g.Girlid, VarTrainPos) > 0).ToList();
+        if (row is null || row.Time <= 0 || capacity <= 0 || active.Count >= capacity)
+        {
+            why = "特训配置不可用或总栏位已满";
+            return false;
+        }
+        int sameType = active.Count(g => _train.PosOf(GetVar(player, g.Girlid, VarTrainPos))?.Type == slot.Type);
+        if (row.MaxNum <= 0 || sameType >= row.MaxNum)
+        {
+            why = "该类型特训栏位已满";
+            return false;
+        }
+        int seconds = row.Time;
         long endAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + seconds;
 
+        _ctx.PledgeTimes.Refresh(player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        _mood.Refresh(session, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         SetVar(session, player, girlId, VarTrainPos, pos);
         SetVar(session, player, girlId, VarTrainTime, (int)endAt);
-        SetVar(session, player, girlId, VarTrainOutId, slot.OutdoorId);
+        SetVar(session, player, girlId, VarTrainOutId, outdoorId);
+        _ctx.PledgeTimes.Refresh(player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        _mood.Refresh(session, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
 
         Log.Info($"[session {session.Id}] GirlLogic/StartTrain 少女 {girlId} → pos={pos}" +
-                 $"（外景 {slot.OutdoorId} 类型 {slot.Type}）{seconds}s 后结束（{endAt}）");
+                 $"（外景 {outdoorId} 类型 {slot.Type}）{seconds}s 后结束（{endAt}）");
         return true;
     }
 
@@ -287,14 +334,23 @@ public sealed class GirlTrainFeature : IGameFeature
     /// <summary>打断特训：清属性、不发奖。</summary>
     private Task OnInterruptTrain(ClientSession session, Player player, JsonNode? param)
     {
-        uint girlId = (uint)ReadInt(param?["nId"]);
+        if (!GachaRequestLimits.TryInteger(param?["nId"], out int requestedGirl) || requestedGirl <= 0)
+        {
+            Fail(session, CmdInterruptTrain, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        uint girlId = (uint)requestedGirl;
         if (girlId == 0 || GetVar(player, girlId, VarTrainPos) <= 0)
         {
             Fail(session, CmdInterruptTrain, ErrGeneric);
             return Task.CompletedTask;
         }
 
+        _ctx.PledgeTimes.Refresh(player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        _mood.Refresh(session, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         ClearTrain(session, player, girlId);
+        _ctx.PledgeTimes.Refresh(player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        _mood.Refresh(session, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         _ctx.Store.Save(player);
         Ok(session, CmdInterruptTrain, new JsonObject { ["nId"] = girlId });
         Log.Info($"[session {session.Id}] GirlLogic/InterruptTrain 少女 {girlId} 特训已打断（不发奖）");
@@ -308,7 +364,12 @@ public sealed class GirlTrainFeature : IGameFeature
     /// </summary>
     private Task OnEndTrain(ClientSession session, Player player, JsonNode? param)
     {
-        uint girlId = (uint)ReadInt(param?["nId"]);
+        if (!GachaRequestLimits.TryInteger(param?["nId"], out int requestedGirl) || requestedGirl <= 0)
+        {
+            Fail(session, CmdEndTrain, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        uint girlId = (uint)requestedGirl;
         int pos = girlId == 0 ? 0 : GetVar(player, girlId, VarTrainPos);
         if (pos <= 0)
         {
@@ -329,47 +390,162 @@ public sealed class GirlTrainFeature : IGameFeature
 
         int outId = GetVar(player, girlId, VarTrainOutId);
         var slot = _train.PosOf(pos);
-        var row = _train.TrainingFor(outId > 0 ? outId : slot?.OutdoorId ?? 0, slot?.Type ?? 0);
+        var row = _train.TrainingFor(outId > 0 ? outId : CurrentOutdoor(player, _trainHouse), slot?.Type ?? 0);
 
-        // 玩家奖励（Award2 是 GDPLN 五元组，走统一发奖）
-        var granted = _ctx.Rewards.Grant(player, row?.PlayerAwards, RewardSource.Extra);
-
+        var girl = player.GetGirl(girlId);
+        if (row is null || girl is null || endAt <= 0)
+        {
+            Fail(session, CmdEndTrain, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        var reward = TrainingReward(player, row);
+        if (reward.LoveAward < 0 || (long)girl.Exp + reward.LoveAward > int.MaxValue
+            || _headTouchLove.MaxLevel(girlId) <= 1)
+        {
+            Fail(session, CmdEndTrain, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        GirlLoveFeature.AddExp(_headTouchLove, player, girlId, reward.LoveAward, out var delta);
+        if (girl.Level >= _headTouchLove.MaxLevel(girlId))
+        {
+            girl.Exp += (uint)(reward.LoveAward - delta.Added);
+            delta = delta with { Added = reward.LoveAward, NewExp = (int)girl.Exp };
+        }
+        var unlocked = GirlLoveFeature.UnlockStories(_headTouchLove, player, girlId);
+        var granted = _ctx.Rewards.Grant(player, reward.PlayerAwards, RewardSource.Extra);
+        _ctx.PledgeTimes.Refresh(player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        _mood.Refresh(session, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        var actionAchievements = GirlActionAchievements.Record(_headTouchMissions, player, girlId, row.Id);
+        PledgeFeature.RecordAction(_pledge, player, (int)girlId, "Training", 1, row.Id);
         ClearTrain(session, player, girlId);
+        _ctx.PledgeTimes.Refresh(player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        _mood.Refresh(session, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         _ctx.Store.Save(player);
-
+        GameNotify.PushGirl(session, girl);
+        GameNotify.PushTaskValues(session, unlocked);
+        GameNotify.PushTaskValues(session, actionAchievements);
+        GameNotify.PushRewards(session, player, granted);
+        var money = reward.PlayerAwards.FirstOrDefault(a => a.Length >= 5) ?? new[] { 0, 0, 0, 0, 0 };
         var reply = new JsonObject
         {
             ["nId"] = girlId,
-            // nMoney / AddExpInfo：客户端 OnEndTrain 会读，给成空表也安全
-            ["nMoney"] = new JsonArray(),
-            ["AddExpInfo"] = new JsonObject
-            {
-                // Award1 = 好感度（`TrainingGirl.txt` 的 Award1 列，现网外景72/Id1 是 60）
-                ["nLove"] = row?.LoveAward ?? 0,
-            },
+            ["nMoney"] = new JsonArray(money.Take(5).Select(v => (JsonNode?)JsonValue.Create(v)).ToArray()),
+            ["AddExpInfo"] = new JsonArray { delta.Added, delta.OldExp, delta.NewExp,
+                delta.OldLevel, delta.NewLevel },
         };
         Ok(session, CmdEndTrain, reply);
 
         Log.Info($"[session {session.Id}] GirlLogic/EndTrain 少女 {girlId} 结算：" +
-                 $"好感 +{row?.LoveAward ?? 0}、玩家奖励 {granted.Describe()}");
+                 $"好感 +{reward.LoveAward}、玩家奖励 {granted.Describe()}");
         return Task.CompletedTask;
     }
 
     // ================= HeadTouched =================
 
+    // GirlConfig.MaxTouchHeadCount=5, TouchHeadTime=3600;
+    // GirlCommon reads remaining uses/time from task group 2, ids 101/102.
+    internal const int HeadTouchGroup = 2;
+    internal const int HeadTouchCount = 101;
+    internal const int HeadTouchTime = 102;
+    internal const int MaxHeadTouches = 5;
+    internal const int HeadTouchInterval = 3600;
+
+    /// <summary>Repair missing legacy counters and settle elapsed recharge intervals.</summary>
+    internal static bool RefreshHeadTouches(Player player, long now)
+    {
+        int count = player.GetTask(HeadTouchGroup, HeadTouchCount);
+        int time = player.GetTask(HeadTouchGroup, HeadTouchTime);
+        int oldCount = count, oldTime = time;
+        bool missing = !player.Tasks.ContainsKey(Player.ComposeTaskId(HeadTouchGroup, HeadTouchCount));
+        // Compatibility default for saves made before this system was implemented.
+        if (missing && time == 0) count = MaxHeadTouches;
+        count = Math.Max(0, count);
+        if (count >= MaxHeadTouches)
+            time = 0;
+        else if (time <= 0)
+            time = (int)now;
+        else if (now > time)
+        {
+            long intervals = (now - time) / HeadTouchInterval;
+            count = (int)Math.Min(MaxHeadTouches, count + intervals);
+            time = count >= MaxHeadTouches ? 0 : (int)(time + intervals * HeadTouchInterval);
+        }
+        if (!missing && count == oldCount && time == oldTime) return false;
+        player.SetTask(HeadTouchGroup, HeadTouchCount, count);
+        player.SetTask(HeadTouchGroup, HeadTouchTime, time);
+        return true;
+    }
+
     /// <summary>
-    /// 摸头。真机实测客户端会发 <c>{"sCmd":"HeadTouched"}</c>（`work/unhandled-roadmap.md`）。
-    /// 客户端侧没有 <c>OnHeadTouched</c>（`GirlLogic.lua` 里查不到）⇒ 属于
-    /// **fire-and-forget**：Dispatcher 找不到 `OnHeadTouched` 就什么都不做，
-    /// 但 `Blocking.Hide()` 已经执行了。所以回一个空包即可，纯粹为了解遮罩 + 不刷 unhandled。
+    /// GirlLogic.OnHeadTouched exists and requires nType to route the completion
+    /// action to UI_Main, UI_Girl or the tutorial. The restored reward is 50 affection.
     /// </summary>
     private Task OnHeadTouched(ClientSession session, Player player, JsonNode? param)
     {
-        uint girlId = (uint)ReadInt(param?["nId"]);
-        Ok(session, CmdHeadTouched, new JsonObject { ["nId"] = girlId });
-        Log.Info($"[session {session.Id}] GirlLogic/HeadTouched 少女 {girlId}（客户端无 OnHeadTouched，仅解遮罩）");
+        if (!GachaRequestLimits.TryInteger(param?["nId"], out int requestedGirl) || requestedGirl <= 0)
+        {
+            Fail(session, CmdHeadTouched, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        uint girlId = (uint)requestedGirl;
+        int source = 0;
+        if (param?["nType"] is { } sourceNode && !GachaRequestLimits.TryInteger(sourceNode, out source))
+        {
+            Fail(session, CmdHeadTouched, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        if (player.GetGirl(girlId) is null || source < 0 || source > 2)
+        {
+            Fail(session, CmdHeadTouched, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        bool refreshed = RefreshHeadTouches(player, now);
+        int count = player.GetTask(HeadTouchGroup, HeadTouchCount);
+        if (count <= 0)
+        {
+            if (refreshed) _ctx.Store.Save(player);
+            PushHeadTouches(session, player);
+            Fail(session, CmdHeadTouched, 2); // Girl.NullTouch
+            return Task.CompletedTask;
+        }
+        // Restored historical head-touch reward, authorized by the user: +50 affection.
+        // Reuse the same level curve and cap as gifts; never write a raw +50 to Exp.
+        GirlLoveFeature.AddExp(_headTouchLove, player, girlId, HeadTouchLoveReward, out var delta);
+        player.SetTask(HeadTouchGroup, HeadTouchCount, count - 1);
+        if (player.GetTask(HeadTouchGroup, HeadTouchTime) == 0)
+            player.SetTask(HeadTouchGroup, HeadTouchTime, (int)now);
+        PledgeFeature.RecordAction(_pledge, player, (int)girlId, "TouchHead");
+        var achievements = RecordHeadTouchAchievements(_headTouchMissions, player, girlId);
+        var unlockedStories = GirlLoveFeature.UnlockStories(_headTouchLove, player, girlId);
+        _ctx.Store.Save(player);
+        PushHeadTouches(session, player);
+        GameNotify.PushTaskValues(session, achievements);
+        GameNotify.PushTaskValues(session, unlockedStories);
+        GameNotify.PushGirl(session, player.GetGirl(girlId)!);
+        var reply = new JsonObject
+        {
+            ["nId"] = girlId, ["nType"] = source,
+            ["nAddExp"] = delta.Added,
+            ["nOldExp"] = delta.OldExp, ["nNewExp"] = delta.NewExp,
+            ["nOldLevel"] = delta.OldLevel, ["nNewLevel"] = delta.NewLevel,
+        };
+        if (delta.IsMaxLevel) reply["nIsMaxlevel"] = true;
+        Ok(session, CmdHeadTouched, reply);
+        Log.Info($"[session {session.Id}] GirlLogic/HeadTouched girl={girlId} source={source} remaining={count - 1}");
         return Task.CompletedTask;
     }
+
+    /// <summary>Achievement type 15 counts completed head touches, shared across girls.</summary>
+    internal static List<KeyValuePair<uint, int>> RecordHeadTouchAchievements(MissionTable missions, Player player, uint girlId = 0)
+        => GirlActionAchievements.Record(missions, player, girlId, null);
+
+    private static void PushHeadTouches(ClientSession session, Player player)
+        => GameNotify.PushTaskValues(session, new[]
+        {
+            new KeyValuePair<uint, int>(Player.ComposeTaskId(HeadTouchGroup, HeadTouchCount), player.GetTask(HeadTouchGroup, HeadTouchCount)),
+            new KeyValuePair<uint, int>(Player.ComposeTaskId(HeadTouchGroup, HeadTouchTime), player.GetTask(HeadTouchGroup, HeadTouchTime)),
+        });
 
     private Task Unknown(ClientSession session, string sCmd, JsonNode? param)
     {
@@ -386,18 +562,53 @@ public sealed class GirlTrainFeature : IGameFeature
         return v > 0 ? v : DefaultTrainPosCount;
     }
 
+    // GirlConfig.GetTrainingAward: take affection and currency maxima independently
+    // over owned, region-visible outdoors, including the built-in default 72.
+    internal TrainingRow TrainingReward(Player player, TrainingRow training)
+    {
+        var owned = HouseFeature.ReadOrCreate(player, _trainHouse).Furniture
+            .Select(f => _trainHouse.ItemOf(f.TemplateId))
+            .Where(t => t is not null && t.Type == _trainHouse.OutDoorScene
+                && (string.IsNullOrEmpty(t.ThemeType) || _trainThemes.Contains(t.ThemeType)))
+            .Select(t => t!.Id).Append((int)HouseTable.OutdoorObjId).Distinct();
+        var rows = owned.Select(id => _train.TrainingFor(id, training.Id))
+            .Where(r => r is not null).Select(r => r!).ToList();
+        int love = rows.Select(r => r.LoveAward).DefaultIfEmpty(0).Max();
+        // The original table has one Award2 GDPLN per training. Match its item key
+        // and maximize only its count, without mutating the shared config arrays.
+        var awards = training.PlayerAwards.Select(a =>
+        {
+            var copy = a.ToArray();
+            if (copy.Length >= 5)
+                copy[4] = rows.SelectMany(r => r.PlayerAwards)
+                    .Where(b => b.Length >= 5 && b.Take(4).SequenceEqual(copy.Take(4)))
+                    .Select(b => b[4]).DefaultIfEmpty(0).Max();
+            return copy;
+        }).ToList();
+        return training with { LoveAward = love, PlayerAwards = awards };
+    }
+
+    // Outdoor templates share Type=OutDoorScene; only placed furniture belongs to
+    // the scene. The built-in default outdoor is client-owned and absent in saves.
+    internal static int CurrentOutdoor(Player player, HouseTable table)
+        => HouseFeature.ReadOrCreate(player, table).Furniture
+            .Where(f => f.RoomId == HouseFeature.OutdoorRoomId && f.ParentId != 0
+                && table.ItemOf(f.TemplateId)?.Type == table.OutDoorScene)
+            .Select(f => f.TemplateId).FirstOrDefault(table.OutDoorScene);
+
     internal static int GetVar(Player player, uint girlId, int off)
-        => player.GetTask(GmUnlock.GirlVarGroup, GmUnlock.GirlTaskId(girlId, off));
+        => player.GetTask(GirlLoveFeature.VarGroup(girlId), GirlLoveFeature.VarTaskId(girlId, off));
 
     /// <summary>写少女属性并**立刻推 pf 1026** —— 客户端要靠它读 TrainPos/TrainTime。</summary>
     private static void SetVar(ClientSession session, Player player, uint girlId, int off, int value)
     {
-        int taskId = GmUnlock.GirlTaskId(girlId, off);
-        player.SetTask(GmUnlock.GirlVarGroup, taskId, value);
+        int taskId = GirlLoveFeature.VarTaskId(girlId, off);
+        int group = GirlLoveFeature.VarGroup(girlId);
+        player.SetTask(group, taskId, value);
         GameNotify.PushTaskValues(session, new[]
         {
             new KeyValuePair<uint, int>(
-                Player.ComposeTaskId(GmUnlock.GirlVarGroup, taskId), value),
+                Player.ComposeTaskId(group, taskId), value),
         });
     }
 

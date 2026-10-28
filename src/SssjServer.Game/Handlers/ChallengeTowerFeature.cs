@@ -64,8 +64,8 @@ namespace SssjServer.Game.Handlers;
 /// <c>UI_MissionSuccess.lua:2056..2061</c> <c>OnSaveDataCallback()</c> **无参**，
 /// 只调 <c>self.fnEndCallback()</c>（退出流程）。
 /// ⇒ 服务端要先把「保留后的分数」推成任务值，再回包（与 §22.2 同型）。
-/// ★ 上行是**裸布尔**（<c>UI_MissionSuccess.lua:2028/2033</c> 传 <c>false</c>/<c>true</c>）——
-/// <c>true</c> = 保留本次成绩、<c>false</c> = 放弃。
+/// ★ 原版上行是裸布尔；本地客户端扩展为 { battleToken, keep } 防止旧场次请求串入。
+/// <c>keep=true</c> 保留本次成绩，<c>keep=false</c> 放弃。
 /// </summary>
 public sealed class ChallengeTowerFeature : IGameFeature
 {
@@ -98,13 +98,26 @@ public sealed class ChallengeTowerFeature : IGameFeature
 
     private GameFeatureContext _ctx = null!;
     private ChallengeTable _table = ChallengeTable.Empty;
+    private TwentyFirstTowerHandler _restoredTower = null!;
+    private ChallengeRuns _runs = null!;
+    private ChallengeSeasons _seasons = null!;
 
     public string Name => "排行塔（LuaCall 53/54/55/56 + 206 积分领奖 / 207 保留成绩）";
 
     public void Install(GameFeatureContext ctx)
     {
         _ctx = ctx;
+        _restoredTower = new TwentyFirstTowerHandler(ctx);
         _table = ChallengeTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
+        _seasons = new ChallengeSeasons(ctx.Store, _table, Path.GetFullPath(ctx.Options.SettingDirectory));
+        _runs = new ChallengeRuns(ctx, _table, _seasons);
+        ctx.MapFunction("ChallengeCancel", _runs.Cancel);
+        ctx.MapFunction("GameRankMsg", OnRank);
+        ctx.OnPlayerPrepare((session, player) =>
+        {
+            _seasons.Refresh(session, player, notify: false);
+            RefreshDaily(session, player, notify: false);
+        });
 
         ctx.MapLuaCall(CmdGetTower, OnGetTower);
         ctx.MapLuaCall(CmdEnterTower, OnEnterTower);
@@ -124,9 +137,20 @@ public sealed class ChallengeTowerFeature : IGameFeature
     /// </summary>
     internal Task OnGetTower(ClientSession session, int cmd, JsonNode? param)
     {
+        if (TwentyFirstTowerHandler.IsGet(param)) return _restoredTower.Get(session, cmd, param);
         if (session.Tag is not Player player)
             return Task.CompletedTask;
 
+        try
+        {
+            _seasons.Refresh(session, player);
+            RefreshDaily(session, player);
+        }
+        catch (Exception)
+        {
+            _ctx.LuaCalls.CallClient(session, cmd, new JsonObject { ["ActivityType"] = ActivityTypeChallenge, ["nError"] = ErrGeneric });
+            return Task.CompletedTask;
+        }
         int week = _table.CurrentWeekIndex(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         int total = player.GetTask(ChallengeTable.Group, ChallengeTable.TaskTotalScore);
 
@@ -136,8 +160,25 @@ public sealed class ChallengeTowerFeature : IGameFeature
         _ctx.LuaCalls.CallClient(session, cmd, new JsonObject
         {
             ["ActivityType"] = ActivityTypeChallenge,
+            ["pendingScore"] = _runs.PendingScore(player),
+            ["cycle"] = _seasons.ScheduleJson(),
         });
         return Task.CompletedTask;
+    }
+
+    private void RefreshDaily(ClientSession session, Player player, bool notify = true)
+    {
+        lock (player)
+        {
+            var changed = new List<KeyValuePair<uint, int>>();
+            var before = new ChallengeMutationSnapshot(player);
+            try
+            {
+                if (ChallengeDaily.Refresh(player, _table.AttackTimes, _seasons.Now, changed)) _ctx.Store.SaveRequired(player);
+            }
+            catch { before.Restore(player); throw; }
+            if (notify) GameNotify.PushTaskValues(session, changed);
+        }
     }
 
     // ================================================================ 54 进关
@@ -153,6 +194,7 @@ public sealed class ChallengeTowerFeature : IGameFeature
     /// </summary>
     internal Task OnEnterTower(ClientSession session, int cmd, JsonNode? param)
     {
+        if (TwentyFirstTowerHandler.IsRun(param)) return _restoredTower.Enter(session, cmd, param);
         if (session.Tag is not Player)
             return Task.CompletedTask;
 
@@ -172,12 +214,7 @@ public sealed class ChallengeTowerFeature : IGameFeature
         Log.Info($"[session {session.Id}] Activities_EnterTower(54) 排行塔 塔{towerId} "
                + $"节点{nodeId} 关卡{levelId}");
 
-        // ★ tbData 是位置数组（客户端 tbParam.tbData[1..4]）
-        _ctx.LuaCalls.CallClient(session, cmd, new JsonObject
-        {
-            ["tbData"] = new JsonArray { type, towerId, nodeId, levelId },
-        });
-        return Task.CompletedTask;
+        return _runs.Enter(session, cmd, param);
     }
 
     // ================================================================ 55 通关 / 失败结算
@@ -188,13 +225,12 @@ public sealed class ChallengeTowerFeature : IGameFeature
     ///
     /// ★★ 回包必须带 <c>isPass</c>（**布尔**）：客户端
     /// <c>UI_MissionSuccess.lua:240/264</c> 是 <c>if isPass == false then</c> 显式比较。
-    /// 本服无法从上行区分成败（两条路都发 55）⇒ 依据「本次是否有击杀信息/额外参数」不可靠，
-    /// 因此**一律按通关处理**（<c>isPass = true</c>）：
-    /// 排行塔的失败结算与通关结算在服务端侧行为相同（都只记积分），
-    /// 而客户端自己知道成败、界面已按本地状态渲染。
+    /// CalculationChallengeScore 在第六项 tbExtraParam.isPass 中提供布尔胜败。
+    /// 缺失或畸形结果拒绝结算，不能把失败默认提升为通关。
     /// </summary>
     internal Task OnPassTower(ClientSession session, int cmd, JsonNode? param)
     {
+        if (TwentyFirstTowerHandler.IsRun(param)) return _restoredTower.Pass(session, cmd, param);
         if (session.Tag is not Player player)
             return Task.CompletedTask;
 
@@ -209,17 +245,20 @@ public sealed class ChallengeTowerFeature : IGameFeature
 
         int levelId = args.Count > 3 ? args[3] : 0;
 
-        Log.Info($"[session {session.Id}] Activities_PassTower(55) 排行塔关卡 {levelId} 结算"
-               + "（★ 失败也走这条，服务端行为相同：只记积分）");
-
-        // ★ tbData 是奖励数组（map:GameEnd 的第 2 参）；排行塔的关卡奖励未取证 ⇒ 回空数组
-        //   （客户端 UI_MissionSuccess.lua:681/698 判 `#self.tbAwards > 0`，空数组安全）
-        _ctx.LuaCalls.CallClient(session, cmd, new JsonObject
+        if (param is not JsonArray { Count: >= 6 } positional
+            || positional[5] is not JsonObject extra
+            || extra["isPass"] is not JsonValue result
+            || !result.TryGetValue<bool>(out bool isPass))
         {
-            ["tbData"] = new JsonArray(),
-            ["isPass"] = true,          // ★ 必须是布尔（客户端 == false 显式比较）
-        });
-        return Task.CompletedTask;
+            var error = new JsonObject { ["nError"] = ErrGeneric };
+            if (ChallengeRuns.TokenFromSettlement(param) is { } token) error["battleToken"] = token;
+            _ctx.LuaCalls.CallClient(session, cmd, error);
+            return Task.CompletedTask;
+        }
+
+        Log.Info($"[session {session.Id}] Activities_PassTower(55) 排行塔关卡 {levelId} 结算 isPass={isPass}");
+
+        return _runs.Settle(session, cmd, param, isPass);
     }
 
     /// <summary>
@@ -229,6 +268,7 @@ public sealed class ChallengeTowerFeature : IGameFeature
     /// </summary>
     internal Task OnFailTower(ClientSession session, int cmd, JsonNode? param)
     {
+        if (TwentyFirstTowerHandler.IsRun(param)) return _restoredTower.Fail(session, cmd, param);
         Log.Info($"[session {session.Id}] Activities_FailTower(56) 收到"
                + "（排行塔链路本不该走这条，按原厂回空包）");
         _ctx.LuaCalls.CallClient(session, cmd, new JsonObject());
@@ -238,39 +278,12 @@ public sealed class ChallengeTowerFeature : IGameFeature
     // ================================================================ 207 保留成绩
 
     /// <summary>
-    /// 207 结算后是否保留成绩。上行是**裸布尔**
-    /// （<c>UI_MissionSuccess.lua:2028</c> 传 <c>false</c>、<c>:2033</c> 传 <c>true</c>）。
-    ///
-    /// ★ 消费点 <c>OnSaveDataCallback()</c>（<c>:2056</c>）**不收参数**、只调退出回调
-    /// ⇒ 先推任务值、再回包（§22.2）。
-    /// ★ 本次单局得分来自客户端上报的 <c>SingleScore</c>，但那是 55 的
-    /// <c>tbExtraParam</c> 里的内容、且原厂在此已弹过确认框
-    /// ⇒ 服务端这里只负责「把当前累计分固化」，不重算分数。
+    /// Token-bound save/discard decision. The local client extends the original
+    /// boolean payload to { battleToken, keep } to reject delayed old decisions.
+    /// Score tasks and the daily quota change only after durable acceptance.
     /// </summary>
     internal Task OnExitSave(ClientSession session, int cmd, JsonNode? param)
-    {
-        if (session.Tag is not Player player)
-            return Task.CompletedTask;
-
-        bool keep = ReadBool(param);
-        int total = player.GetTask(ChallengeTable.Group, ChallengeTable.TaskTotalScore);
-
-        Log.Info($"[session {session.Id}] Challenge_Exit_Save(207) "
-               + $"{(keep ? "保留" : "放弃")}本次成绩（当前总积分 {total}）");
-
-        // 保留时把总分推一遍（客户端界面按任务值渲染）；放弃时不动数据
-        if (keep)
-        {
-            GameNotify.PushTaskValues(session, new[]
-            {
-                new KeyValuePair<uint, int>(
-                    Player.ComposeTaskId(ChallengeTable.Group, ChallengeTable.TaskTotalScore), total),
-            });
-        }
-
-        _ctx.LuaCalls.CallClient(session, cmd, new JsonObject());
-        return Task.CompletedTask;
-    }
+        => _runs.ExitSave(session, cmd, param);
 
     // ================================================================ 206 积分奖励一键领取
 
@@ -290,8 +303,57 @@ public sealed class ChallengeTowerFeature : IGameFeature
         if (session.Tag is not Player player)
             return Task.CompletedTask;
 
+        lock (player)
+        {
+            try { _seasons.Refresh(session, player); }
+            catch (Exception)
+            {
+                _ctx.LuaCalls.CallClient(session, cmd, new JsonObject { ["res"] = false });
+                return Task.CompletedTask;
+            }
+            return AwardSomeLocked(session, cmd, player);
+        }
+    }
+
+    private Task OnRank(ClientSession session, string function, JsonNode? param)
+    {
+        if (session.Tag is not Player player) return Task.CompletedTask;
+        var args = param as JsonArray;
+        int top = args is { Count: > 0 } ? ChallengeSeasons.Number(args[0]) : 0;
+        int detail = args is { Count: > 1 } ? ChallengeSeasons.Number(args[1]) : 0;
+        var data = new JsonObject { ["tbId"] = new JsonArray(top, detail, 1), ["me"] = 0, ["max"] = 0, ["other"] = new JsonArray() };
+        var response = new JsonObject { ["tbData"] = data, ["isFirst"] = true };
+        try
+        {
+            if (top == 1 && detail == 0)
+            {
+                lock (player)
+                {
+                    _seasons.Refresh(session, player);
+                    int start = args is { Count: > 4 } && args[4] is JsonArray { Count: > 0 } page
+                        ? Math.Max(0, ChallengeSeasons.Number(page[0])) : 0;
+                    int count = args is { Count: > 4 } && args[4] is JsonArray { Count: > 1 } size
+                        ? Math.Clamp(ChallengeSeasons.Number(size[1]), 1, 100) : 50;
+                    response = _seasons.RankReply(player, start, count);
+                }
+            }
+        }
+        catch (Exception) { response["nError"] = ErrGeneric; }
+        _ctx.LuaCalls.CallClientFunction(session, "ServerRankMsg", response);
+        return Task.CompletedTask;
+    }
+
+    private Task AwardSomeLocked(ClientSession session, int cmd, Player player)
+    {
+
         int total = player.GetTask(ChallengeTable.Group, ChallengeTable.TaskTotalScore);
         int claimed = player.GetTask(ChallengeTable.Group, ChallengeTable.TaskRewardLevel);
+
+        if (total < 0 || claimed < 0)
+        {
+            _ctx.LuaCalls.CallClient(session, cmd, new JsonObject { ["res"] = false });
+            return Task.CompletedTask;
+        }
 
         var list = _table.ClaimableRewards(total, claimed);
         if (list.Count == 0)
@@ -304,16 +366,25 @@ public sealed class ChallengeTowerFeature : IGameFeature
         }
 
         var granted = new RewardGrantResult();
-        foreach (var r in list)
-        {
-            if (r.Rewards.Count > 0)
-                _ctx.Rewards.Grant(player, r.Rewards, RewardSource.Extra, granted);
-        }
-
-        // ★ 记「已领到的最大 Goal」
+        var before = new ChallengeMutationSnapshot(player);
         int newClaimed = list.Max(r => r.Goal);
-        player.SetTask(ChallengeTable.Group, ChallengeTable.TaskRewardLevel, newClaimed);
-        _ctx.Store.Save(player);
+        try
+        {
+            foreach (var r in list)
+            {
+                if (r.Rewards.Count > 0)
+                    _ctx.Rewards.Grant(player, r.Rewards, RewardSource.Extra, granted);
+            }
+            player.SetTask(ChallengeTable.Group, ChallengeTable.TaskRewardLevel, newClaimed);
+            _ctx.Store.SaveRequired(player);
+        }
+        catch (Exception e)
+        {
+            before.Restore(player);
+            Log.Warn($"[session {session.Id}] Challenge_Award_Some(206) 未保存，奖励与领取进度已回滚：{e.Message}");
+            _ctx.LuaCalls.CallClient(session, cmd, new JsonObject { ["res"] = false });
+            return Task.CompletedTask;
+        }
 
         Log.Info($"[session {session.Id}] Challenge_Award_Some(206) 领取 {list.Count} 档"
                + $"（Goal {string.Join(',', list.Select(r => r.Goal))}）：已领档位 {claimed} → {newClaimed}"

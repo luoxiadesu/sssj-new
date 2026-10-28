@@ -113,7 +113,7 @@ namespace SssjServer.Game.Handlers;
 ///   进度沿用已存任务值（客户端 pf 1027 写入或将来别的功能写入），服务端不猜。</item>
 /// </list>
 /// </summary>
-public sealed class MissionFeature : IGameFeature
+public sealed class MissionFeature : IGameFeature, IGamePulseFeature
 {
     // ---------------- 上行 sFunction（客户端 → 服务端）----------------
 
@@ -295,7 +295,7 @@ public sealed class MissionFeature : IGameFeature
             return Task.CompletedTask;
         });
 
-        // 登录钩子：把派生进度（当前只有指引任务的通关条件）算好并推 pf 1026。
+        // 登录钩子：把指引通关、角色补给累计数等可派生进度算好并推 pf 1026。
         // 没有它的话，玩家「通关 → 重登 → 打开指引任务面板」会看到进度 0，
         // 直到本族任意一条上行命令触发 SyncAndPush 才补上。
         ctx.OnPlayerLogin((session, player) =>
@@ -320,6 +320,20 @@ public sealed class MissionFeature : IGameFeature
     /// </summary>
     private Task Handle(ClientSession session, string function, JsonNode? param, int nMission)
     {
+        if (session.Tag is Player player)
+        {
+            lock (player) return HandleLocked(session, function, param, nMission);
+        }
+        return Task.CompletedTask;
+    }
+
+    void IGamePulseFeature.OnPlayerPulse(ClientSession session, Player player)
+    {
+        lock (player) SyncAndPush(session, player);
+    }
+
+    private Task HandleLocked(ClientSession session, string function, JsonNode? param, int nMission)
+    {
         if (session.Tag is not Player player)
         {
             Log.Warn($"[session {session.Id}] {function} 到达但会话未登录（Tag 非 Player），忽略");
@@ -330,7 +344,7 @@ public sealed class MissionFeature : IGameFeature
         int nId = ReadInt(param?["nId"], 0);
         int nType = ReadInt(param?["nType"], 0);
 
-        // 先把「服务端能自己算的进度」刷新一遍（当前只有指引任务的通关条件），
+        // 先把「服务端能自己算的进度」刷新一遍（指引通关、角色补给累计数），
         // 再做判定 —— 否则玩家刚通关就领奖会被判「进度不足」。
         SyncAndPush(session, player);
 
@@ -523,13 +537,36 @@ public sealed class MissionFeature : IGameFeature
     }
 
     /// <summary>
-    /// 服务端能自己算出来的进度。目前只有一种：<c>GuideMission.txt</c> 的
+    /// 服务端能自己算出来的进度：角色补给累计数，以及 <c>GuideMission.txt</c> 的
     /// <c>targetChapter</c>「完成条件(通关关卡)」列（形如 <c>[1-1-1]</c>）→
     /// 用 <see cref="Player.Levels"/> 的通关次数（<c>MapList.PassCount</c>）当进度。
     /// 其余任务（战斗次数、消耗体力、强化…）需要各系统埋点，没有取证，返回 0。
     /// </summary>
     internal static int DerivedProgress(Player player, MissionEntry entry)
     {
+        // AchieveType 1: player level; 135: specified girl's affection level.
+        // These are current-state conditions used by CardRefit, not historical counters.
+        if (entry.Group == MissionTable.OtherGroup)
+        {
+            // AchieveType 69: [card count, enhance level]; 172: [girl, enhance level, count].
+            // Count owned quantities (including locked cards), never rarity Level.
+            if (entry.AchieveType is 69 or 172 && entry.Counts.Count >= 2 && entry.Counts[1] > 0)
+            {
+                if (entry.AchieveType == 172 && (entry.Counts.Count < 3 || entry.Counts[0] <= 0)) return 0;
+                long count = 0;
+                foreach (var card in player.Items)
+                    if (card.Genre == 1 && card.Count > 0 && card.EnhanceLevel >= (uint)entry.Counts[1] &&
+                        (entry.AchieveType == 69 || card.Detail == (uint)entry.Counts[0]))
+                        count = Math.Min(int.MaxValue, count + card.Count);
+                return (int)count;
+            }
+            if (entry.AchieveType == 1) return Math.Max(0, player.Level);
+            if (entry.AchieveType == 135 && entry.Counts.Count >= 2 && entry.Counts[1] > 0)
+                return (int)Math.Min(int.MaxValue, player.GetGirl((uint)entry.Counts[1])?.Level ?? 0u);
+        }
+        // AchieveType.txt 60: 在补给中招募角色卡累计数量；普通与已确认新人补给共用此总数。
+        if (entry.Group == MissionTable.NormalGroup && entry.AchieveType == 60)
+            return Math.Max(0, player.GetTask(GachaFeature.TaskGroup, GachaFeature.TaskTotal));
         if (entry.TargetChapter.Count < 3)
             return 0;
 
@@ -659,6 +696,7 @@ public sealed class MissionFeature : IGameFeature
     {
         yield return ("mission", _table.Daily);
         yield return ("achieve", _table.Achieve);
+        yield return ("other", _table.AchieveOther);
         yield return ("guide", _table.Guide);
         yield return ("club", _table.Club);
     }

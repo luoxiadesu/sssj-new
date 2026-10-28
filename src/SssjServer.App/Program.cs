@@ -61,7 +61,8 @@ public static class Program
             await Task.WhenAll(
                 Task.Run(() => gateway.RunAsync(cts.Token)),
                 Task.Run(() => http.RunAsync(cts.Token)),
-                Task.Run(() => WatchGmFileAsync(options.GmFile, cts.Token)));
+                Task.Run(() => WatchGmFileAsync(options.GmFile, cts.Token)),
+                Task.Run(() => WatchGachaRotationAsync(options.SettingDirectory, cts.Token)));
         }
         catch (OperationCanceledException)
         {
@@ -84,6 +85,21 @@ public static class Program
     /// 轮询 500ms、只比对内容（不看 mtime），避免 WSL/挂载点的时间戳精度问题。
     /// 首次启动时**不执行**已存在的内容（只记录基线），防止重启即重放上次命令。
     /// </summary>
+    private static async Task WatchGachaRotationAsync(string directory, CancellationToken ct)
+    {
+        var rotation = SssjServer.Game.Config.GachaRotation.For(directory);
+        string last = rotation.Revision(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(1000, ct);
+            string next = rotation.Revision(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            if (next == last) continue;
+            last = next;
+            GmConsole.Broadcast(rotation.ClientLua());
+            Log.Info("[gacha-rotation] 排期已同步；重新进入补给页刷新列表");
+        }
+    }
+
     private static async Task WatchGmFileAsync(string path, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(path))

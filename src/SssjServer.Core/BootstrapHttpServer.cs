@@ -234,7 +234,7 @@ public sealed class BootstrapHttpServer
             ["banners"] = new JsonArray(),
             ["notices"] = new JsonArray(
                 Item(1, "本地服务端",
-                     "这是 sssj-new 本地服务端下发的公告。\n登录 / 关卡 / 背包 / 签到等功能已可用。")),
+                     "制作人：SteveS，勿擅自转发\n\n这是 sssj-new 本地服务端下发的公告。\n登录 / 关卡 / 背包 / 签到等功能已可用。")),
             ["activity"] = new JsonArray(),
             ["news"] = new JsonArray(),
             ["LoginNotice"] = new JsonArray(),
@@ -256,6 +256,7 @@ public sealed class BootstrapHttpServer
           .tip{color:#7a8494;font-size:13px;margin-top:24px}
         </style></head><body>
         <h1>sssj-new 本地服务端</h1>
+        <p><strong>制作人：SteveS，勿擅自转发</strong></p>
         <p>这是本地服务端提供的公告页（<code>GET /notice.html</code>）。</p>
         <h2>已可用</h2>
         <p>登录 · 主线关卡与结算 · 编队 · 背包与分解 · 每日签到 · 任务成就领奖 · 咖啡馆数据 · 手机短信</p>

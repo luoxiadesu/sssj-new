@@ -1,4 +1,4 @@
-using SssjServer.Core;
+﻿using SssjServer.Core;
 
 namespace SssjServer.Game.Config;
 
@@ -68,12 +68,10 @@ public sealed class TrainTable
     public TrainPosRow? PosOf(int pos) => _pos.TryGetValue(pos, out var v) ? v : null;
 
     /// <summary>
-    /// 查「外景 + 类型」对应的特训内容。外景对不上时退化为只按类型找第一条 ——
-    /// 现网 40 行覆盖多个外景，但同类型的时长/奖励一致，退化是安全的。
+    /// 严格按「外景 + 类型」读取；不同外景的奖励并不相同。
     /// </summary>
     public TrainingRow? TrainingFor(int outdoorId, int type)
-        => _training.FirstOrDefault(t => t.OutdoorId == outdoorId && t.Id == type)
-           ?? _training.FirstOrDefault(t => t.Id == type);
+        => _training.FirstOrDefault(t => t.OutdoorId == outdoorId && t.Id == type);
 
     public static TrainTable Load(string settingDir)
     {
@@ -104,7 +102,9 @@ public sealed class TrainTable
             if (!int.TryParse(cells[0], out int outId) || !int.TryParse(cells[1], out int pos) || pos <= 0)
                 continue;
             int.TryParse(cells[3], out int type);
-            _pos[pos] = new TrainPosRow(outId, pos, type);
+            // GirlConfig.LoadTrainPos intentionally shares Pos -> Type across outdoors.
+            // OutdoorId here is provenance only; rewards use the equipped outdoor.
+            _pos.TryAdd(pos, new TrainPosRow(outId, pos, type));
         }
     }
 
@@ -112,7 +112,7 @@ public sealed class TrainTable
     {
         if (!File.Exists(path))
         {
-            Log.Warn($"[setting] 找不到 {TrainingFileName}，特训内容表降级为空（时长按 {FallbackSeconds}s 兜底）");
+            Log.Warn($"[setting] 找不到 {TrainingFileName}，特训内容表降级为空（开始特训会拒绝）");
             return;
         }
 

@@ -128,6 +128,7 @@ public sealed class GirlLoveFeature : IGameFeature
     public const int CurGirlTaskId = 20000;
 
     private GameFeatureContext _ctx = null!;
+    private PledgeTable _pledge = PledgeTable.Empty;
     private GirlLoveTable _love = GirlLoveTable.Empty;
 
     public string Name => "少女好感度/羁绊剧情（GirlGift/ViewStory + LuaCall 173,174,175,255,256）";
@@ -152,6 +153,7 @@ public sealed class GirlLoveFeature : IGameFeature
     public void Install(GameFeatureContext ctx)
     {
         _ctx = ctx;
+        _pledge = PledgeTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
         _love = GirlLoveTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
 
         ctx.AddFunctionCoHandler(Function, OnGirlLogicCommand);
@@ -314,10 +316,14 @@ public sealed class GirlLoveFeature : IGameFeature
     /// </summary>
     private Task OnGirlGift(ClientSession session, Player player, JsonNode? param)
     {
-        uint girlId = (uint)ReadInt(param?["nId"]);
-        int num = Math.Max(1, ReadInt(param?["ItemNum"], 1));
-
-        var gdpl = ReadTuple(param?["tbItem"]);
+        var body = param as JsonObject;
+        uint girlId = (uint)ReadInt(body?["nId"]);
+        if (body?["ItemNum"] is not JsonValue number || !number.TryGetValue<int>(out int num) || num <= 0)
+        {
+            Fail(session, CmdGirlGift, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        var gdpl = ReadTuple(body?["tbItem"]);
         if (girlId == 0 || gdpl is null)
         {
             Fail(session, CmdGirlGift, ErrGeneric);
@@ -335,7 +341,7 @@ public sealed class GirlLoveFeature : IGameFeature
 
         // ★ 满级先判：客户端只认 nCode == 4，这是唯一有提示的失败
         int maxLevel = _love.MaxLevel(girlId);
-        if (player.GetGirl(girlId)!.Level >= maxLevel)
+        if (maxLevel <= 1)
         {
             Fail(session, CmdGirlGift, ErrGiftMaxLevel);
             Log.Info($"[session {session.Id}] GirlLogic/GirlGift 少女 {girlId} 已满级（{maxLevel}）→ nError=4");
@@ -358,29 +364,38 @@ public sealed class GirlLoveFeature : IGameFeature
             return Task.CompletedTask;
         }
 
-        // ★ 扣道具与加经验必须原子（E.3 ②：只加经验不扣道具 = 无限好感度）
+        // Validate the complete batch before changing either gifts or affection.
+        long available = player.Items.Where(i => i.Genre == (uint)g && i.Detail == (uint)d
+            && i.Particular == (uint)p && i.Level == (uint)l && i.LockOn == 0)
+            .Sum(i => (long)i.Count);
+        bool love = _love.IsLoveGift(girlId, g, d, p, l);
+        long requestedExp = GiftExperiencePerItem(perExp, love, GirlLoveTable.IsLinkGirl(girlId)) * num;
+        if (available < num || requestedExp > int.MaxValue - (long)player.GetGirl(girlId)!.Exp)
+        {
+            Fail(session, CmdGirlGift, ErrGeneric);
+            return Task.CompletedTask;
+        }
+
+        bool gained = AddExp(player, girlId, (int)requestedExp, out var delta);
+        var giftedGirl = player.GetGirl(girlId)!;
+        int cap = _love.MaxLevel(girlId);
+        if (!gained && (cap <= 1 || giftedGirl.Level < cap))
+        {
+            Fail(session, CmdGirlGift, ErrGiftMaxLevel);
+            return Task.CompletedTask;
+        }
+        if (giftedGirl.Level >= cap)
+        {
+            int overflow = (int)requestedExp - delta.Added;
+            giftedGirl.Exp += (uint)overflow;
+            delta = delta with { Added = (int)requestedExp, NewExp = (int)giftedGirl.Exp };
+        }
         var changed = new List<Item>();
         var removed = new List<Item>();
         int taken = TakeItems(player, g, d, p, l, num, changed, removed);
-        if (taken <= 0)
-        {
-            Fail(session, CmdGirlGift, ErrGeneric);
-            Log.Warn($"[session {session.Id}] GirlLogic/GirlGift 道具 {g}-{d}-{p}-{l} 不足（要 {num}、有 0）");
-            return Task.CompletedTask;
-        }
-
-        bool love = _love.IsLoveGift(girlId, g, d, p, l);
-        // ★ 「喜爱礼物」的加成倍率**未取证**（不在客户端 Lua 里）⇒ 不做倍率，只回 bLove 让客户端播特效。
-        int addExp = perExp * taken;
-
-        if (!AddExp(player, girlId, addExp, out var delta))
-        {
-            // 理论上前面已挡掉满级，这里兜底：道具已扣就不再回退（与原服「先扣后加」同序）
-            Fail(session, CmdGirlGift, ErrGiftMaxLevel);
-            Log.Warn($"[session {session.Id}] GirlLogic/GirlGift 少女 {girlId} 加经验失败（已扣 {taken} 个礼物）");
-            _ctx.Store.Save(player);
-            return Task.CompletedTask;
-        }
+        PledgeFeature.RecordAction(_pledge, player, (int)girlId, "GiftCount", taken, l);
+        var unlocked = UnlockStories(player, girlId);
+        unlocked.AddRange(UnlockSecrets(_love, player, girlId, new[] { g, d, p, l }));
 
         _ctx.Store.Save(player);
 
@@ -391,6 +406,7 @@ public sealed class GirlLoveFeature : IGameFeature
         if (changed.Count > 0)
             GameNotify.PushItems(session, changed);
         GameNotify.PushGirl(session, player.GetGirl(girlId)!);
+        GameNotify.PushTaskValues(session, unlocked);
 
         var reply = new JsonObject
         {
@@ -462,6 +478,15 @@ public sealed class GirlLoveFeature : IGameFeature
             return Task.CompletedTask;
         }
 
+        var story = _love.StoryOf(girlId, storyId);
+        var girl = player.GetGirl(girlId);
+        if (story is null || girl is null || ELevelOffset(storyId) < 0 ||
+            girl.Level < story.Level || !_love.IsFriendlinessUnlocked(girlId, story.Level) ||
+            !StoryConditionMet(player, story))
+        {
+            Fail(session, CmdViewStory, ErrGeneric);
+            return Task.CompletedTask;
+        }
         int cur = GetVar(player, girlId, ELevelOffset(storyId));
         if (cur >= ELevelRead)
         {
@@ -471,7 +496,18 @@ public sealed class GirlLoveFeature : IGameFeature
             return Task.CompletedTask;
         }
 
-        var story = _love.StoryOf(girlId, storyId);
+        if (story.IsMain && !GirlLoveTable.IsLinkGirl(girlId))
+        {
+            var mains = _love.StoriesOf(girlId).Where(kv => kv.Value.IsMain)
+                .OrderBy(kv => kv.Value.Level).ThenBy(kv => kv.Key).ToList();
+            int ordinal = mains.FindIndex(kv => kv.Key == storyId) + 1;
+            if (ordinal <= 0 || GetVar(player, girlId, VarMainStoryId) < ordinal - 1)
+            {
+                Fail(session, CmdViewStory, ErrGeneric);
+                return Task.CompletedTask;
+            }
+        }
+
         var granted = _ctx.Rewards.Grant(player, story?.Award, RewardSource.Extra);
 
         SetVar(session, player, girlId, ELevelOffset(storyId), ELevelRead);
@@ -497,12 +533,25 @@ public sealed class GirlLoveFeature : IGameFeature
         uint girlId = (uint)ReadInt(param?["nId"]);
         int level = ReadInt(param?["Level"]);
 
-        Ok(session, CmdViewLinkStory, new JsonObject
+        var story = _love.LinkStoryOf(girlId, level);
+        var girl = player.GetGirl(girlId);
+        if (!GirlLoveTable.IsLinkGirl(girlId) || girl is null || story is null || girl.Level < level)
         {
-            ["nId"] = girlId,
-            ["Level"] = level,
-        });
-        Log.Info($"[session {session.Id}] GirlLogic/ViewLinkStory 少女 {girlId} Level={level}（联动剧情，仅回执）");
+            Fail(session, CmdViewLinkStory, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        int old = GetVar(player, girlId, VarMainStoryId);
+        uint mask = 1u << story.Index;
+        if (((uint)old & mask) != 0)
+        {
+            Fail(session, CmdViewLinkStory, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        var granted = _ctx.Rewards.Grant(player, story.Award, RewardSource.Extra);
+        SetVar(session, player, girlId, VarMainStoryId, unchecked((int)((uint)old | mask)));
+        _ctx.Store.Save(player);
+        GameNotify.PushRewards(session, player, granted);
+        Ok(session, CmdViewLinkStory, new JsonObject { ["nId"] = girlId, ["Level"] = level });
         return Task.CompletedTask;
     }
 
@@ -585,11 +634,13 @@ public sealed class GirlLoveFeature : IGameFeature
         if (girlId == 0 || player.GetGirl(girlId) is null)
             girlId = player.Girls.Count > 0 ? player.Girls[0].Girlid : 0;
         AddExp(player, girlId, mission.AddGirlLove, out var delta);
+        var unlockedStories = UnlockStories(player, girlId);
 
         // ★★ 置 bit0 = 已领（保留 bit1..31 的进度）
         player.SetTask(MissionGroup, missionId, packed | 1);
         _ctx.Store.Save(player);
 
+        GameNotify.PushTaskValues(session, unlockedStories);
         GameNotify.PushRewards(session, player, granted);
         if (girlId != 0 && player.GetGirl(girlId) is { } girl)
             GameNotify.PushGirl(session, girl);
@@ -703,8 +754,8 @@ public sealed class GirlLoveFeature : IGameFeature
     /// 256 记录大剧情观看进度：<c>SetTask(group, (girlId-1)*2000 + 14, nValue)</c> **原样存整数**。
     ///
     /// ★★ <c>nValue</c> 有**两种语义**（C.0）：普通少女是**顺序计数器**、联动少女是**位域**。
-    /// 差异完全由客户端承担（它算好再发上来）⇒ 服务端**不要解释、不要做「只能递增」校验**
-    /// （原服 <c>SetMainStoryIdOnServer</c> 就是无脑透传，`GirlCommon.lua:1167..1171`）。
+    /// 普通少女按配置顺序逐段推进并校验好感门槛；重播允许回退。联动位域保留原样处理。
+    /// 原服转发本身不校验；本地增加与普通少女UI顺序一致的服务器保护。
     /// ★★★ 原服**不回包**（<c>MODULE_SERVER</c> 分支里连 <c>CallClient</c> 都没有）⇒ 本实现也不回。
     /// 但**必须推 pf 1026**，否则重登后客户端读回 0 ⇒ 所有剧情又变「未看」。
     /// </summary>
@@ -722,6 +773,30 @@ public sealed class GirlLoveFeature : IGameFeature
         }
 
         int before = GetVar(player, girlId, VarMainStoryId);
+        // Ordinary girls use an ordinal; link girls use a bit field.
+        if (!GirlLoveTable.IsLinkGirl(girlId))
+        {
+            var mains = _love.StoriesOf(girlId).Where(kv => kv.Value.IsMain)
+                .OrderBy(kv => kv.Value.Level).ThenBy(kv => kv.Key).ToList();
+            if (player.GetGirl(girlId) is not { } girl || value < 0 || value > mains.Count ||
+                (long)value > (long)before + 1) return Task.CompletedTask;
+            if (value > before && (girl.Level < mains[value - 1].Value.Level ||
+                !_love.IsFriendlinessUnlocked(girlId, mains[value - 1].Value.Level)))
+                return Task.CompletedTask;
+        }
+
+        if (GirlLoveTable.IsLinkGirl(girlId))
+        {
+            // Link UI submits ViewLinkStory on completion. Its reward bits are server-owned.
+            // A generic progress upload must neither create nor clear claimed rewards.
+            if (player.GetGirl(girlId) is not null)
+                GameNotify.PushTaskValues(session, new[]
+                {
+                    new KeyValuePair<uint, int>(Player.ComposeTaskId(VarGroup(girlId),
+                        VarTaskId(girlId, VarMainStoryId)), before)
+                });
+            return Task.CompletedTask;
+        }
         SetVar(session, player, girlId, VarMainStoryId, value);
         _ctx.Store.Save(player);
 
@@ -754,15 +829,28 @@ public sealed class GirlLoveFeature : IGameFeature
     /// </summary>
     internal void SyncStoryUnlocks(ClientSession session, Player player)
     {
-        int marked = 0;
-        foreach (var girl in player.Girls)
+        var unlocked = UnlockStories(player);
+        if (unlocked.Count > 0)
+            Log.Info($"少女剧情：新解锁 {unlocked.Count} 段");
+    }
+
+    internal List<KeyValuePair<uint, int>> UnlockStories(Player player, uint? onlyGirl = null)
+        => UnlockStories(_love, player, onlyGirl);
+
+    internal static List<KeyValuePair<uint, int>> UnlockStories(GirlLoveTable love, Player player, uint? onlyGirl = null)
+    {
+        var changes = new List<KeyValuePair<uint, int>>();
+        foreach (var girl in player.Girls.Where(g => onlyGirl is null || g.Girlid == onlyGirl))
         {
             uint girlId = girl.Girlid;
-            foreach (var (storyIndex, story) in _love.StoriesOf(girlId))
+            changes.AddRange(UnlockSecrets(love, player, girlId));
+            foreach (var (storyIndex, story) in love.StoriesOf(girlId))
             {
                 if (girl.Level < story.Level)
                     continue;
-                if (!_love.IsFriendlinessUnlocked(girlId, story.Level))
+                if (!StoryConditionMet(player, story))
+                    continue;
+                if (!love.IsFriendlinessUnlocked(girlId, story.Level))
                     continue;
 
                 int off = ELevelOffset(storyIndex);
@@ -772,12 +860,47 @@ public sealed class GirlLoveFeature : IGameFeature
                     continue;       // 已解锁（1）或已读（>1）：不动
 
                 player.SetTask(VarGroup(girlId), VarTaskId(girlId, off), ELevelUnread);
-                marked++;
+                changes.Add(new KeyValuePair<uint, int>(
+                    Player.ComposeTaskId(VarGroup(girlId), VarTaskId(girlId, off)), ELevelUnread));
             }
         }
 
-        if (marked > 0)
-            Log.Info($"[session {session.Id}] 少女剧情：新解锁 {marked} 段（ELevel 置 1 = 已解锁未读）");
+        return changes;
+    }
+
+    internal static List<KeyValuePair<uint, int>> UnlockSecrets(GirlLoveTable love, Player player,
+        uint girlId, int[]? gifted = null)
+    {
+        var changes = new List<KeyValuePair<uint, int>>();
+        var girl = player.GetGirl(girlId);
+        if (girl is null) return changes;
+        foreach (var secret in love.SecretsOf(girlId))
+        {
+            bool hasGift = secret.Gift.Length >= 4;
+            bool eligible = hasGift ? gifted is not null && secret.Gift.Take(4).SequenceEqual(gifted)
+                : secret.Level > 0 && girl.Level >= secret.Level;
+            int offset = 100 + secret.Index - 1;
+            if (!eligible || GetVar(player, girlId, offset) != 0) continue;
+            int task = VarTaskId(girlId, offset), group = VarGroup(girlId);
+            player.SetTask(group, task, 1);
+            changes.Add(new(Player.ComposeTaskId(group, task), 1));
+        }
+        return changes;
+    }
+
+    // UI_GirlGift.lua: favorite gifts use floor(base * 1.25), or *2 for link girls.
+    // Round each item before multiplying by the requested count.
+    internal static long GiftExperiencePerItem(int baseExp, bool favorite, bool linkGirl)
+        => baseExp <= 0 ? 0 : !favorite ? baseExp : linkGirl ? (long)baseExp * 2 : (long)baseExp * 5 / 4;
+
+    internal static bool StoryConditionMet(Player player, GirlLoveTable.StoryAward story)
+    {
+        var cond = story.Condition;
+        if (cond is null || cond.Length == 0) return true;
+        if (cond[0] == -1) return false;
+        if (cond[0] == 1 && cond.Length >= 4 && cond[1] > 0 && cond[2] > 0 && cond[3] > 0)
+            return MapList.PassCount(player.GetLevelStar(MapList.MapId(cond[1], cond[2], cond[3]))) > 0;
+        return false; // Unknown conditions must not grant rewards.
     }
 
     // ================= 工具 =================
@@ -790,7 +913,7 @@ public sealed class GirlLoveFeature : IGameFeature
     {
         if (storyIndex <= 0)
             return -1;
-        int off = VarELevelBase + storyIndex;
+        int off = VarELevelBase + storyIndex - 1;
         return off <= VarELevelMax ? off : -1;
     }
 
@@ -804,7 +927,7 @@ public sealed class GirlLoveFeature : IGameFeature
     /// <summary>
     /// 少女属性的 taskId：<c>(girlId - 1) * 2000 + off</c>，
     /// ★ 联动少女先减 200（`GirlCommon.lua:1516..1518`）。
-    /// <see cref="GmUnlock.GirlTaskId"/> 没有这个重映射，所以本域自己算。
+    /// 与 <see cref="GmUnlock.GirlTaskId"/> 的联动局部ID映射一致。
     /// </summary>
     internal static int VarTaskId(uint girlId, int off)
     {
@@ -850,7 +973,7 @@ public sealed class GirlLoveFeature : IGameFeature
         {
             if (taken >= want)
                 break;
-            uint use = (uint)Math.Min(want - taken, (int)item.Count);
+            uint use = (uint)Math.Min((long)want - taken, item.Count);
             if (use == 0)
                 continue;
             if (use >= item.Count)
@@ -876,12 +999,12 @@ public sealed class GirlLoveFeature : IGameFeature
     /// </summary>
     private static (int G, int D, int P, int L)? ReadTuple(JsonNode? node)
     {
-        if (node is not JsonArray arr || arr.Count < 4)
+        if (node is not JsonArray arr || arr.Count != 4)
             return null;
         int[] v = new int[4];
         for (int i = 0; i < 4; i++)
         {
-            if (arr[i] is null || !int.TryParse(arr[i]!.ToString(), out v[i]))
+            if (arr[i] is not JsonValue value || !value.TryGetValue<int>(out v[i]) || v[i] <= 0)
                 return null;
         }
         return (v[0], v[1], v[2], v[3]);

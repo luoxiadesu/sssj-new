@@ -111,8 +111,10 @@ public class UserProfileFeatureTests
         await h.DispatchLuaCallAsync(UserProfileFeature.GetExhibitionItemCmd, "{}");
 
         var arr = Assert.IsType<JsonArray>(Payload(h));
-        Assert.Single(arr);
+        Assert.Equal(3, arr.Count);
         Assert.Equal(card.Guid, arr[0]!.GetValue<uint>());
+        Assert.Equal(0u, arr[1]!.GetValue<uint>());
+        Assert.Equal(0u, arr[2]!.GetValue<uint>());
     }
 
     /// <summary>最多 3 个槽（`UI_User.lua:1370` 的 `{0,0,0}`）。</summary>
@@ -147,7 +149,7 @@ public class UserProfileFeatureTests
         await h.DispatchLuaCallAsync(UserProfileFeature.SetExhibitionWeaponCmd, "[12345]");
         await h.DispatchLuaCallAsync(UserProfileFeature.GetExhibitionWeaponCmd, "{}");
 
-        Assert.Empty(Assert.IsType<JsonArray>(Payload(h)));
+        Assert.Equal(new uint[] { 0, 0, 0 }, Assert.IsType<JsonArray>(Payload(h)).Select(n => n!.GetValue<uint>()));
     }
 
     // ================= 持久化 / 健壮性 =================
@@ -181,15 +183,50 @@ public class UserProfileFeatureTests
 
     /// <summary>guid 解析：0 与非数字都要被丢掉（0 是客户端的「空槽」占位）。</summary>
     [Fact]
-    public void ParseGuids_DropsZeroAndGarbage()
+    public void ParseGuids_PreservesPositionsAndCapsAtThree()
     {
-        Assert.Equal(new uint[] { 7, 9 },
+        Assert.Equal(new uint[] { 7, 0, 0 },
             UserProfileFeature.ParseGuids(JsonNode.Parse("""[7,0,"x",9,null]""")));
         // 对象包装的几种键名都吃
         Assert.Equal(new uint[] { 5 },
             UserProfileFeature.ParseGuids(JsonNode.Parse("""{"tbItems":[5]}""")));
         Assert.Empty(UserProfileFeature.ParseGuids(JsonNode.Parse("{}")));
         Assert.Empty(UserProfileFeature.ParseGuids(null));
+    }
+
+    [Theory]
+    [InlineData(1, 74, 73, "cards")]
+    [InlineData(2, 78, 77, "weapons")]
+    public async Task ExhibitionSlotsPreserveGapsReplacementAndPersistence(int genre, int setter, int getter, string key)
+    {
+        using var h = await FeatureHarness.CreateAsync("profile-gaps-" + genre);
+        var first = h.Player.AddItem((uint)genre, 1, 1, 3, count: 1);
+        var second = h.Player.AddItem((uint)genre, 1, 2, 3, count: 1);
+        await h.DispatchLuaCallAsync(setter, $"[0,{first.Guid},{second.Guid}]");
+        Assert.Equal(new uint[] { 0, first.Guid, second.Guid }, UserProfileFeature.ReadSlots(h.Player, key));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(new uint[] { 0, first.Guid, second.Guid }, UserProfileFeature.ReadSlots(saved, key));
+        first.Count = 0;
+        await h.DispatchLuaCallAsync(getter, "{}");
+        Assert.Equal(new uint[] { 0, 0, second.Guid }, Assert.IsType<JsonArray>(Payload(h)).Select(n => n!.GetValue<uint>()));
+        await h.DispatchLuaCallAsync(setter, $"[{second.Guid},0,0]");
+        Assert.Equal(new uint[] { second.Guid, 0, 0 }, UserProfileFeature.ReadSlots(h.Player, key));
+        await h.DispatchLuaCallAsync(setter, "{}");
+        Assert.Equal(new uint[] { second.Guid, 0, 0 }, UserProfileFeature.ReadSlots(h.Player, key));
+        await h.DispatchLuaCallAsync(setter, "[]");
+        Assert.Equal(new uint[] { 0, 0, 0 }, UserProfileFeature.ReadSlots(h.Player, key));
+    }
+
+    [Theory]
+    [InlineData(1, 74, "cards")]
+    [InlineData(2, 78, "weapons")]
+    public async Task ExhibitionRejectsWrongGenreAndDuplicateInstancesWithoutShifting(int genre, int setter, string key)
+    {
+        using var h = await FeatureHarness.CreateAsync("profile-owned-" + genre);
+        var held = h.Player.AddItem((uint)genre, 1, 1, 3, count: 1);
+        var other = h.Player.AddItem((uint)(genre == 1 ? 2 : 1), 1, 1, 3, count: 1);
+        await h.DispatchLuaCallAsync(setter, $"[{other.Guid},{held.Guid},{held.Guid}]");
+        Assert.Equal(new uint[] { 0, held.Guid, 0 }, UserProfileFeature.ReadSlots(h.Player, key));
     }
 
     /// <summary>命令号与 `LuaCall.lua:69..77` 的定义一致。</summary>

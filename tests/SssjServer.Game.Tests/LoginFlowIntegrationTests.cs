@@ -167,8 +167,16 @@ public class LoginFlowIntegrationTests : IAsyncLifetime
         //     自己那部分（例如聊天域的 pf 1012 系统欢迎语），数量会随新功能域增加。
         //     断言「紧接着的下一个包」本身就是脆的，这里改成「跳到目标 pf」，
         //     跳过的包也照样解密以推进 CBC 链（AGENTS.md §2.3）。
-        var ntfCallPkt = await ReadPacketOfPfAsync(stream, crypto, GamePf.NtfS2CCall);
-        var ntfCall = ProtoMessage.Parse<NtfS2CCall>(crypto.Decrypt(ntfCallPkt.Payload));
+        NtfS2CCall ntfCall;
+        do
+        {
+            var ntfCallPkt = await ReadPacketOfPfAsync(stream, crypto, GamePf.NtfS2CCall);
+            ntfCall = ProtoMessage.Parse<NtfS2CCall>(crypto.Decrypt(ntfCallPkt.Payload));
+            using var candidate = System.Text.Json.JsonDocument.Parse(ntfCall.SJsonParam);
+            var candidateCmd = candidate.RootElement.GetProperty("sCmd").GetInt32();
+            if (candidateCmd == 10002) break;
+            Assert.Equal(999999, candidateCmd);
+        } while (true);
         Assert.Equal("LuaCall", ntfCall.SFunction);
         using (var doc = System.Text.Json.JsonDocument.Parse(ntfCall.SJsonParam))
         {

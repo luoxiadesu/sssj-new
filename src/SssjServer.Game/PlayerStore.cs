@@ -55,6 +55,13 @@ public sealed class PlayerStore
 
     /// <summary>保存账号存档（目录按需创建，原子写）。</summary>
     public void Save(Player player)
+        => SaveCore(player, required: false);
+
+    /// <summary>Persist a transaction before acknowledging it; failures must reach its rollback.</summary>
+    internal void SaveRequired(Player player)
+        => SaveCore(player, required: true);
+
+    private void SaveCore(Player player, bool required)
     {
         EnsureDir();
         var dto = PlayerDto.FromPlayer(player);
@@ -66,6 +73,7 @@ public sealed class PlayerStore
         catch (Exception e)
         {
             Log.Error($"[store] 序列化玩家存档失败 account={player.Account}：{e.Message}");
+            if (required) throw;
             return;
         }
 
@@ -81,6 +89,7 @@ public sealed class PlayerStore
             catch (Exception e)
             {
                 Log.Error($"[store] 写玩家存档失败 account={player.Account} path={path}：{e.Message}");
+                if (required) throw;
             }
         }
     }

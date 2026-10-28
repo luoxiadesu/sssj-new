@@ -1,4 +1,4 @@
-using SssjServer.Core;
+﻿using SssjServer.Core;
 
 namespace SssjServer.Game.Config;
 
@@ -87,7 +87,7 @@ public sealed class WeaponTable
     /// </summary>
     /// <param name="Rarity">稀有度。</param>
     /// <param name="MaxLevels">按突破次数递增的等级上限（含 0 次）。</param>
-    /// <param name="Costs">每次突破的消耗：(道具 id, 货币 id, 货币数)；下标 0 = 第 1 次突破。</param>
+    /// <param name="Costs">每次突破的消耗：(材料数量, 货币 id, 货币数)；下标 0 = 第 1 次突破。</param>
     public sealed record BreakRow(int Rarity, List<int> MaxLevels, List<BreakCost> Costs)
     {
         /// <summary>可突破次数 = <c>MaxLevel1..4</c> 里有值的个数（`GetBreakMaxNum`）。</summary>
@@ -95,7 +95,7 @@ public sealed class WeaponTable
     }
 
     /// <summary>一次突破的消耗。</summary>
-    /// <param name="BreakItem">突破材料的 id 编号（<c>BreakItem&lt;n&gt;</c> 列）。</param>
+    /// <param name="BreakItem">突破材料的数量（<c>BreakItem&lt;n&gt;</c> 列）。</param>
     /// <param name="CurrencyId">货币 id。</param>
     /// <param name="CurrencyCount">货币数量。</param>
     public sealed record BreakCost(int BreakItem, int CurrencyId, int CurrencyCount);

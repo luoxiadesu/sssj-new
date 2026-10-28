@@ -1,4 +1,4 @@
-using SssjServer.Core;
+﻿using SssjServer.Core;
 using SssjServer.Game;
 using SssjServer.Protocol;
 using SssjServer.Protocol.GsProto;
@@ -268,6 +268,23 @@ public class TaskValueTests : IDisposable
     }
 
     // ---- 7. 1006 rename handler ----
+    [Fact]
+    public async Task LoginRepairsNamedCompletedSaveAndPersistsGate()
+    {
+        var player = _module.World.GetOrCreatePlayer("named-returning");
+        player.Name = "RestorationTester";
+        player.SetTask(1, 15, 6);
+        player.SetTask(1, 14, 0);
+        _module.Store.Save(player);
+        await _module.HandleLogin(_session, new Packet
+        {
+            Pf = GamePf.Login, Serial = 1,
+            Payload = new LoginReq { Account = "named-returning", Channel = "selftest" }.ToByteArray()
+        });
+        Assert.Equal(1, _module.World.FindOnlineByAccount("named-returning")!.GetTask(1, 14));
+        Assert.Equal(1, _module.Store.Load("named-returning")!.GetTask(1, 14));
+    }
+
     [Fact]
     public async Task Rename_RepliesOnPf1006_SameSerial_EmptyRsp_SetsNameAndTask114()
     {

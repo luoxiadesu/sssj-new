@@ -91,6 +91,20 @@ internal sealed class FeatureHarness : IDisposable
         return PushedPf.Contains(pf);
     }
 
+    // A real client reads while the server sends. Large, repeated login snapshots can fill
+    // the loopback receive window if a test waits for the synchronous sender before reading.
+    public async Task DrainWhileAsync(Func<Task> action)
+    {
+        var work = Task.Run(action);
+        while (!work.IsCompleted)
+        {
+            DrainPushedPf();
+            await Task.WhenAny(work, Task.Delay(10));
+        }
+        await work;
+        DrainPushedPf();
+    }
+
     /// <summary>把 loopback 上已到达的字节解析成 pf 列表（非阻塞）。</summary>
     private void DrainPushedPf()
     {
@@ -235,6 +249,18 @@ internal sealed class FeatureHarness : IDisposable
     public Task DispatchLuaCallAsync(int cmd, string tbParamJson)
         => LuaCalls.DispatchAsync(Session, LuaCallRouter.LuaCallFunction,
                                   $"{{\"sCmd\":{cmd},\"tbParam\":{tbParamJson}}}");
+
+    // Explicit test client for the patched chapter protocol, including the entry token.
+    internal string ChapterBattleToken => Outbound.Select(o => System.Text.Json.Nodes.JsonNode.Parse(o.Json))
+        .Where(o => o?["nState"]?.ToString() == "0" && o?["nError"]?.ToString() == "0")
+        .Select(o => o!["battleToken"]!.GetValue<string>()).LastOrDefault() ?? "no-entry";
+
+    internal Task CompleteChapterAsync(int chapter, int index, int diff, int stars = 7, bool success = true)
+        => DispatchFunctionAsync("ChapterMsg", new System.Text.Json.Nodes.JsonObject
+        {
+            ["nState"] = 1, ["Chapter"] = chapter, ["Index"] = index, ["Difficult"] = diff,
+            ["nStar"] = stars, ["bSuccess"] = success, ["battleToken"] = ChapterBattleToken,
+        }.ToJsonString());
 
     /// <summary>取最后一条下行（断言用）；没有下行时抛。</summary>
     public (string Function, string Json) LastOutbound

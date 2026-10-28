@@ -151,7 +151,8 @@ public sealed class ShopTabRow
     /// （与抽卡的左闭右开不同，别照抄 <see cref="GachaPool.IsOpenAt"/>）。
     /// </summary>
     public bool IsOpenAt(long now)
-        => !HasTimeWindow || (now >= BeginTime && now <= EndTime);
+        // Tower 21 is replayed locally; its original exchange shop follows that replay window.
+        => !HasTimeWindow || (now >= BeginTime && now <= (ShopId == 30045 ? 3376684800L : EndTime));
 
     /// <summary>
     /// 下一次手动刷新要花多少钱。

@@ -113,6 +113,7 @@ public sealed class CharacterCardTemplate
 
     /// <summary>被动技能 2（<c>PassiveSkill2</c> 列，第 58 列）。0 表示无。</summary>
     public int PassiveSkill2 { get; init; }
+    public int ResistanceSkill { get; init; }
 
     /// <summary>中文名（来自旁表 <c>CharacterCardName.txt</c>，仅日志用；缺表为空串）。</summary>
     public string DisplayName { get; set; } = "";
@@ -243,6 +244,7 @@ public sealed class CharacterCardTable
                 TacticalSkill = raw.Int(row, "TacticalSkill"),
                 PassiveSkill1 = raw.Int(row, "PassiveSkill1"),
                 PassiveSkill2 = raw.Int(row, "PassiveSkill2"),
+                ResistanceSkill = raw.Int(row, "ResistanceSkill"),
             };
             table._byKey[(tpl.G, tpl.D, tpl.P, tpl.L)] = tpl;
         }

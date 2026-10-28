@@ -9,3 +9,8 @@
 .DS_Store
 *.log
 *.user
+
+# Local Python cache and user-supplied game assets / schedules
+**/__pycache__/
+*.py[cod]
+/extracted/

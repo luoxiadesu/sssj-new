@@ -6,7 +6,7 @@ namespace SssjServer.Game.Handlers;
 
 /// <summary>
 /// 福利页「活动成就」领奖（上行 <c>NormalActivityGetAward</c> 的 <c>nType == 1</c> 分支，
-/// 覆盖 Template=2 的 6 个开放活动 **2/3/14/15/16/108**）。
+/// 覆盖Template=2活动与重开的Template=5活动262）。
 /// 取证见 `work/activity-award-forensics.md` §4、台账 `docs/05` §29。
 ///
 /// <para><b>0. ★★★ 同一个上行、两条下行通道、两种<u>相反</u>的错误约定</b></para>
@@ -118,6 +118,22 @@ public sealed class ActivityAchieveFeature : IGameFeature
     /// 领奖：校验归属 → 校验没领过 → 校验进度够 → 置 bit0 → **先推 pf 1026 + 奖励，再回包**。
     /// </summary>
     private Task DoClaim(ClientSession session, Player player, int activityId, int achieveId)
+    {
+        lock (player)
+        {
+            if (activityId == 262)
+            {
+                var changes = new List<KeyValuePair<uint, int>>();
+                bool reset = Tower21Missions.RefreshDaily(player, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), changes);
+                Tower21Missions.SyncSp(player, _ctx.Missions, changes);
+                if (reset || changes.Count > 0) _ctx.Store.Save(player);
+                if (changes.Count > 0) GameNotify.PushTaskValues(session, changes);
+            }
+            return ClaimLocked(session, player, activityId, achieveId);
+        }
+    }
+
+    private Task ClaimLocked(ClientSession session, Player player, int activityId, int achieveId)
     {
         // ① 该成就必须属于这个活动（防越活动领奖）
         if (!_activities.Contains(activityId, achieveId))

@@ -686,9 +686,16 @@ public class ChapterSettlementWireTests : IAsyncLifetime
         var param = System.Text.Json.Nodes.JsonNode.Parse(
             """{"nState":1,"Chapter":1,"Index":1,"Difficult":1,"nStar":7,"nTime":42,"nZDL":1234}""");
 
+        await handler.OnScriptCall(_session!, ChapterHandler.Function,
+            System.Text.Json.Nodes.JsonNode.Parse("""{"nState":0,"Chapter":1,"Index":1,"Difficult":1}"""));
+        var entryPackets = await ReadAllPacketsAsync(_clientStream!, expected: 1);
+        var entry = SssjServer.Protocol.ProtoMessage.Parse<SssjServer.Protocol.GsProto.NtfS2CCall>(entryPackets[0].Payload);
+        string token = System.Text.Json.Nodes.JsonNode.Parse(entry.SJsonParam)!["battleToken"]!.GetValue<string>();
+        param!["battleToken"] = token;
+        param["bSuccess"] = true;
         await handler.OnSettle(_session, param);
 
-        var packets = await ReadAllPacketsAsync(_clientStream!, expected: 5);
+        var packets = await ReadAllPacketsAsync(_clientStream!, expected: 6);
 
         // ---- pf 1034 关卡进度 ----
         var chapterNtf = SssjServer.Protocol.ProtoMessage.Parse<SssjServer.Protocol.GsProto.ChapterUpdateNtf>(
@@ -781,11 +788,19 @@ public class ChapterSettlementWireTests : IAsyncLifetime
             rewards: new RewardService(ItemBaseTable.Load(RepoPaths.SettingDir), new Random(7)),
             randomAwards: ChapterRandomAwardTable.Empty);
 
-        await handler.OnSettle(_session, System.Text.Json.Nodes.JsonNode.Parse(
-            """{"nState":1,"Chapter":1,"Index":1,"Difficult":1,"nStar":7}"""));
+        await handler.OnScriptCall(_session!, ChapterHandler.Function,
+            System.Text.Json.Nodes.JsonNode.Parse("""{"nState":0,"Chapter":1,"Index":1,"Difficult":1}"""));
+        var entryPackets = await ReadAllPacketsAsync(_clientStream!, expected: 1);
+        var entry = SssjServer.Protocol.ProtoMessage.Parse<SssjServer.Protocol.GsProto.NtfS2CCall>(entryPackets[0].Payload);
+        string token = System.Text.Json.Nodes.JsonNode.Parse(entry.SJsonParam)!["battleToken"]!.GetValue<string>();
+        var second = System.Text.Json.Nodes.JsonNode.Parse(
+            """{"nState":1,"Chapter":1,"Index":1,"Difficult":1,"nStar":7}""")!;
+        second["battleToken"] = token;
+        second["bSuccess"] = true;
+        await handler.OnSettle(_session, second);
 
         // 只有 1034（进度）+ 1032（晶币）+ 1024（回包）—— 没有 1031，因为没发任何物品
-        var packets = await ReadAllPacketsAsync(_clientStream!, expected: 3);
+        var packets = await ReadAllPacketsAsync(_clientStream!, expected: 4);
         Assert.DoesNotContain(packets, p => p.Pf == GamePf.ItemUpdateNtf);
         Assert.Single(packets, p => p.Pf == GamePf.MoneyUpdateNtf);
 

@@ -95,7 +95,8 @@ namespace SssjServer.Game.Handlers;
 /// 在经营区，<c>703/704/705/706</c> 在休息室。见 <see cref="DefaultFurnitureRow"/>。
 ///
 /// <c>roomList</c> 固定发 <see cref="HouseRooms.Ids"/> = <c>{1, 2, 6}</c>；
-/// <c>themeList</c> 与 <c>petList</c> 留空 —— 后者要注意：<c>UpdatePlayerHouseInfo</c> 末尾会
+/// <c>themeList</c> 下发独立保存的自定方案（模板编号0走客户端自定分支）；
+/// <c>petList</c> 留空 —— 后者要注意：<c>UpdatePlayerHouseInfo</c> 末尾会
 /// <c>Pet.dic.Clear()</c> 再按 <c>petList</c> 重建，但 pf 1048 发生在登录期、
 /// 而宠物数据是进店时 LuaCall 112 的 <c>petstatelist</c> + <c>UpdatePet</c> 才下发的
 /// （见 <see cref="CafePetFeature"/>），顺序上 1048 在前，所以清空无害。
@@ -196,7 +197,7 @@ namespace SssjServer.Game.Handlers;
 /// ⇒ 若本域上线后加载条仍停 0.4，先 grep 上面这几条 logcat 判据；
 /// 服务端侧只需确认「pf 1048 回包里 13 件家具、每件带 pose、templateId 无 20/21」。
 /// </summary>
-public sealed class HouseFeature : IGameFeature
+public sealed partial class HouseFeature : IGameFeature
 {
     /// <summary>
     /// 存档键。★ <b>新键</b>，与 <c>CafeFeature.ExtraKey</c>(<c>"cafe"</c>) /
@@ -334,6 +335,9 @@ public sealed class HouseFeature : IGameFeature
     private GameFeatureContext? _ctx;
     private HouseTable _table = HouseTable.Empty;
     private CafeTable _cafe = CafeTable.Empty;
+    private ShopTable _themeShop = ShopTable.Empty;
+    private CafeComfortSync _comfort = null!;
+    private HousePlacementLimits? _placementLimits;
 
     public string Name => "家园/家具摆设(pf 1048)";
 
@@ -343,15 +347,29 @@ public sealed class HouseFeature : IGameFeature
     public HouseFeature() { }
 
     /// <summary>单测用：直接注入配置表，跳过 <see cref="Install"/>。</summary>
-    internal HouseFeature(HouseTable table) => _table = table;
+    internal HouseFeature(HouseTable table, string? settingDirectory = null)
+    {
+        _table = table;
+        if (settingDirectory is not null)
+        {
+            _placementLimits = new HousePlacementLimits(settingDirectory);
+            _cafe = CafeTable.Load(settingDirectory);
+        }
+    }
 
     public void Install(GameFeatureContext ctx)
     {
         _ctx = ctx;
+        _comfort = new CafeComfortSync(ctx);
         _table = HouseTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
+        _placementLimits = new HousePlacementLimits(Path.GetFullPath(ctx.Options.SettingDirectory));
 
         // ★ 覆盖注册（理由与生效前提见类注释 §6）。不要改 GameModule.cs。
         ctx.MapPf(GamePf.GetHouseInfo, (s, p) => HandleGetHouseInfo(new SessionAdapter(s), p));
+        ctx.MapPf(SssjServer.Protocol.Pf.ClickUpdateHouseReq,
+            (s, p) => HandleUpdateHouse(new SessionAdapter(s), p));
+        ctx.MapPf(SssjServer.Protocol.Pf.ClickDelThemeReq,
+            (s, p) => HandleDeletePlan(new SessionAdapter(s), p));
 
         // 装修域的 5 条 LuaCall
         ctx.MapLuaCall(BuyThemeCmd, OnBuyTheme);
@@ -368,6 +386,7 @@ public sealed class HouseFeature : IGameFeature
         //   用 OnPlayerPrepare（pf 1005 之前）⇒ 变更随登录本来就要发的家具下发一起走，不额外发包。
         ctx.OnPlayerPrepare(GrantMusicSceneForGm);
         _cafe = CafeTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
+        _themeShop = ShopTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
     }
 
     // =================================================================
@@ -391,10 +410,7 @@ public sealed class HouseFeature : IGameFeature
     /// ★ 本族**没有失败通道** —— 客户端只认这一个字符串，失败时我们不回包并记日志。
     ///
     /// <para><b>扣费与入账</b></para>
-    /// 买主题 = 把该主题 <c>Item0..N</c> 列出的家具**全部**加进 <c>Extra["house"]</c>，
-    /// 并把主题 id 记进已购清单。价格按家具的 <c>SellPrice</c> 求和
-    /// （★ <c>NCafeItems.txt</c> 没有「买价」列，只有 <c>SellPrice</c>；
-    /// 本实现拿它当买价 —— 这是**取舍**，原厂买价列未取证）。
+    /// 按商品配置购买实际缺件，预先检查全部费用与容量，家具进入仓库。
     /// </summary>
     private Task OnBuyTheme(ClientSession session, int cmd, JsonNode? param)
     {
@@ -419,74 +435,19 @@ public sealed class HouseFeature : IGameFeature
             return Task.CompletedTask;
         }
 
-        // 价格 = 该主题家具的 SellPrice 之和
-        int price = theme.Items
-            .Select(it => _cafe.Furniture.TryGetValue(it.TemplateId, out var f) ? f.SellPrice : 0)
-            .Sum();
-        int gold = player.GetMoney(GoldMoneyId);
-        if (price > 0 && gold < price)
+        if (!TryBuyMissingTheme(player, theme, obj?["furidlist"], out var granted, out var changedMoney))
         {
-            Log.Info($"[session {session.Id}] CafeHouse_BuyTheme 主题 {themeId} 需 {price} 金币，" +
-                     $"当前 {gold} —— 不回包（本族无失败通道）");
+            Log.Warn($"[session {session.Id}] Theme {themeId} missing-item purchase rejected; no charge or furniture grant");
             return Task.CompletedTask;
         }
-
-        // ---- 入账：家具进 Extra["house"]、主题进已购清单 ----
-        //
-        // ★★★ 摆位（parentId/posX/posY/rotate）必须照 NCafeThemes.txt 的
-        //     Item<i> 原文下发，**不能写 0**（第十二轮修的真 bug）：parentId=0 的家具
-        //     在客户端挂不上场景树节点 ⇒ Obj 恒 null ⇒
-        //     NCafeUtilsController.UpdateNavMeshObstacle(0x1808C18) 遍历时抛 NRE ⇒
-        //     LoadSceneTreeItems 回调链断 ⇒ UI.Open('UI_NCafe') 永不执行 ⇒
-        //     **买过主题的号从此进不了咖啡馆**（map 6 卡 40%，logcat 只有那一条 NRE）。
-        //     取证与判据见 CafeThemeItem / CafeThemeRow.Items 的注释。
-        var state = ReadOrCreate(player, _table, session.Id);
-        var list = state.Furniture.ToList();
-        uint next = state.NextObjId;
-        int added = 0;
-        int blocked = 0;
-        foreach (var it in theme.Items)
-        {
-            if (!_cafe.Furniture.ContainsKey(it.TemplateId))
-                continue;
-
-            // 与 CreateDefault 同一套下发前校验：有毒 templateId 一律不入账，
-            // 否则同样是「进店卡加载条」（见 HouseTable.PoolBlockedTemplateIds）。
-            if (_table.IsPoolBlockedTemplate(it.TemplateId))
-            {
-                Log.Error($"[session {session.Id}] 主题 {themeId} 含 templateId={it.TemplateId}，" +
-                          "在 LoadItem(0x1A3BD10) 的「路径不合法」黑名单里，已跳过该件 —— " +
-                          "下发它会让 InitObjects 静默断链、加载条永远停在 0.4");
-                blocked++;
-                continue;
-            }
-
-            list.Add(new HouseFurniture(
-                ObjId: next++,
-                TemplateId: it.TemplateId,
-                RoomId: theme.Area,
-                ParentId: it.ParentId,
-                PosX: it.PosX, PosY: it.PosY, Rotate: it.Rotate,
-                BizCount: 0,
-                Status: 0));
-            added++;
-        }
-
-        if (price > 0)
-            player.AddMoney(GoldMoneyId, -price);
         owned.Add(themeId);
-        WriteState(player, new HouseState { Furniture = list, NextObjId = next });
         WriteOwnedThemes(player, owned);
+        bool comfortChanged = granted.ChangedFurniture.Count > 0 && _comfort.Refresh(session, player);
         _ctx!.Store.Save(player);
-
-        Log.Info($"[session {session.Id}] 购买主题 {themeId}（{theme.ThemeType}，区域 {theme.Area}）：" +
-                 $"入账家具 {added} 件（照表带摆位）" +
-                 $"{(blocked > 0 ? $"、跳过黑名单 {blocked} 件" : "")}" +
-                 $"、消耗金币 {price} → 余 {player.GetMoney(GoldMoneyId)}");
-
-        if (price > 0)
-            GameNotify.PushMoney(session, player, GoldMoneyId);
-
+        GameNotify.PushMoney(session, player, changedMoney);
+        GameNotify.PushRewards(session, player, granted);
+        _comfort.Push(session, player, comfortChanged);
+        Log.Info($"[session {session.Id}] Theme {themeId}: missing furniture added to storage, existing layout preserved");
         // ★★ 裸字符串，不是对象
         _ctx.LuaCalls.CallClient(session, cmd, BuyThemeOk);
         return Task.CompletedTask;
@@ -563,12 +524,12 @@ public sealed class HouseFeature : IGameFeature
         }
 
         // ★ 上行可能是 JsonArray（别的咖啡馆命令真机上就这样）⇒ 先判类型
-        var ids = new List<uint>();
+        var ids = new HashSet<uint>();
         if (param is JsonObject req && req["objIds"] is JsonArray arr)
         {
             foreach (var n in arr)
             {
-                int v = ReadInt(n, 0);
+                uint v = ReadUInt(n, 0);
                 if (v > 0)
                     ids.Add((uint)v);
             }
@@ -584,12 +545,15 @@ public sealed class HouseFeature : IGameFeature
         var state = ReadOrCreate(player, _table, session.Id);
         var keep = new List<HouseFurniture>();
         var sold = new List<uint>();
-        int income = 0;
+        long income = 0;
 
         foreach (var f in state.Furniture)
         {
             // 只允许卖玩家家具
-            bool target = ids.Contains(f.ObjId) && f.ObjId >= HouseTable.MinPlayerObjId;
+            // UI_CafeStore.Decompose 只提交未在场景启用且有回收价的实例。
+            bool target = ids.Contains(f.ObjId) && f.ObjId >= HouseTable.MinPlayerObjId
+                && (f.RoomId == 0 || f.ParentId == 0)
+                && _cafe.Furniture.TryGetValue(f.TemplateId, out var price) && price.SellPrice > 0;
             if (!target)
             {
                 keep.Add(f);
@@ -608,9 +572,16 @@ public sealed class HouseFeature : IGameFeature
             return Task.CompletedTask;
         }
 
+        // 整批保持原样，避免金币溢出后家具已经消失。
+        if (income > int.MaxValue - (long)player.GetMoney(GoldMoneyId))
+        {
+            _ctx!.LuaCalls.CallClient(session, cmd, new JsonObject { ["objIds"] = new JsonArray() });
+            return Task.CompletedTask;
+        }
         if (income > 0)
-            player.AddMoney(GoldMoneyId, income);
+            player.AddMoney(GoldMoneyId, (int)income);
         WriteState(player, new HouseState { Furniture = keep, NextObjId = state.NextObjId });
+        bool comfortChanged = _comfort.Refresh(session, player);
         _ctx!.Store.Save(player);
 
         Log.Info($"[session {session.Id}] 卖家具 {sold.Count} 件（objId {string.Join(',', sold)}）：" +
@@ -622,7 +593,10 @@ public sealed class HouseFeature : IGameFeature
         var back = new JsonArray();
         foreach (uint id in sold)
             back.Add(id);
-        _ctx.LuaCalls.CallClient(session, cmd, new JsonObject { ["objIds"] = back });
+        // UI_CafeStore.OnRecover reads singular objId, despite LuaCall.lua's
+        // old comment spelling it objIds. Keep the legacy field for compatibility.
+        _ctx.LuaCalls.CallClient(session, cmd, new JsonObject { ["objIds"] = back, ["objId"] = back.DeepClone() });
+        _comfort.Push(session, player, comfortChanged);
         return Task.CompletedTask;
     }
 
@@ -991,7 +965,7 @@ public sealed class HouseFeature : IGameFeature
         if (WriteState(player, state))
             _ctx?.Store.Save(player);
 
-        var rsp = BuildResponse(player.Roleid, state);
+        var rsp = BuildResponse(player.Roleid, state, player);
 
         Log.Info($"[session {session.Id}] 家园数据下发 roleid={player.Roleid}：" +
                  $"玩家家具 {state.Furniture.Count} 件" +
@@ -999,11 +973,109 @@ public sealed class HouseFeature : IGameFeature
                  $"其中餐位 {CountSeats(state)} 张（经营位合计 {state.Furniture.Sum(f => f.BizCount)}）、" +
                  $"分区 {string.Join(',', state.Furniture.GroupBy(f => f.RoomId).OrderBy(g => g.Key).Select(g => $"{g.Key}:{g.Count()}件"))}；" +
                  $"roomList {rsp.HouseInfo!.RoomList.Count} 个（{string.Join(',', rsp.HouseInfo.RoomList.Select(r => r.RoomId))}）、" +
-                 $"主题 0 套、宠物 0 只、访客 0 —— " +
+                 $"自定方案 {ReadPlans(player).Count} 套、宠物 0 只、访客 0 —— " +
                  $"系统家具 54 件由客户端 InitFixedData/InitDefaultData 自建（含外景 {HouseTable.OutdoorObjId}）；" +
                  $"nextObjId={state.NextObjId}");
 
         session.Send(GamePf.GetHouseInfoRsp, packet.Serial, rsp);
+        return Task.CompletedTask;
+    }
+
+    // ReqSaveArea/ReqSaveItems send changed instances, not a replacement inventory.
+    // Room membership is derived from accepted furniture. Custom plan metadata
+    // is stored separately; legacy DIY girl positions cannot overwrite NCafe girls.
+    internal Task HandleUpdateHouse(IGameSession session, Packet packet)
+    {
+        var reply = new UpdateHouseRsp();
+        if (session.Tag is not Player player)
+        {
+            session.Send(SssjServer.Protocol.Pf.UpdateHouseRsp, packet.Serial, reply);
+            return Task.CompletedTask;
+        }
+        reply.Roleid = player.Roleid;
+        UpdateHouseReq req;
+        try { req = SssjServer.Protocol.ProtoMessage.Parse<UpdateHouseReq>(packet.Payload); }
+        catch (Exception e)
+        {
+            Log.Warn($"[session {session.Id}] UpdateHouseReq malformed: {e.Message}");
+            session.Send(SssjServer.Protocol.Pf.UpdateHouseRsp, packet.Serial, reply);
+            return Task.CompletedTask;
+        }
+        if (req.HasRoleid && req.Roleid != player.Roleid)
+        {
+            Log.Warn($"[session {session.Id}] UpdateHouseReq roleid mismatch; ignored");
+            session.Send(SssjServer.Protocol.Pf.UpdateHouseRsp, packet.Serial, reply);
+            return Task.CompletedTask;
+        }
+
+        var state = ReadOrCreate(player, _table, session.Id);
+        var byId = state.Furniture.ToDictionary(f => f.ObjId);
+        int cafeLevel = CafeFeature.ReadState(player, _cafe).Level;
+        bool acceptedLayout = true;
+        var duplicates = req.Furnitures.GroupBy(f => f.ObjId)
+            .Where(g => g.Count() > 1).Select(g => g.Key).ToHashSet();
+        foreach (var change in req.Furnitures.DistinctBy(f => f.ObjId))
+        {
+            if (!byId.TryGetValue(change.ObjId, out var owned))
+            {
+                acceptedLayout = false;
+                Log.Warn($"[session {session.Id}] UpdateHouseReq unowned objId={change.ObjId}; ignored");
+                continue;
+            }
+            var pose = change.Pose;
+            bool valid = !duplicates.Contains(change.ObjId)
+                && (_placementLimits is null || _placementLimits.RoomOpen(cafeLevel, (int)change.RoomId)
+                    || change.RoomId == owned.RoomId && change.ParentId == owned.ParentId)
+                && change.HasTemplateId && change.TemplateId == owned.TemplateId
+                && change.HasRoomId && change.HasParentId && pose is not null
+                && pose.HasPosX && pose.HasPosY && pose.HasRotate
+                && (!pose.HasTemplateId || pose.TemplateId == owned.TemplateId)
+                && (!pose.HasParentTemplateId || pose.ParentTemplateId == change.ParentId)
+                && (change.RoomId == 0
+                    ? change.ParentId == 0
+                    : (HouseRooms.Ids.Contains((int)change.RoomId) || change.RoomId == OutdoorRoomId)
+                      && change.ParentId != 0
+                      && _table.IsAllowedParent(owned.TemplateId, change.ParentId)
+                      && _table.Items.TryGetValue((int)change.ParentId, out var parent)
+                      && HousePoseLimits.Valid(parent, pose.PosX, pose.PosY, pose.Rotate, _table.Items[owned.TemplateId])
+                      && (parent.DicPlace == 0 || parent.DicPlace == change.RoomId
+                          || (change.RoomId == OutdoorRoomId && change.ParentId == 22
+                              && _table.Items[owned.TemplateId].Type == _table.OutDoorScene)));
+            if (valid)
+            {
+                owned = owned with { RoomId = (int)change.RoomId, ParentId = change.ParentId,
+                    PosX = pose!.PosX, PosY = pose.PosY, Rotate = pose.Rotate };
+                byId[owned.ObjId] = owned;
+            }
+            else
+            {
+                acceptedLayout = false;
+                Log.Warn($"[session {session.Id}] UpdateHouseReq invalid placement objId={change.ObjId}; kept authoritative state");
+            }
+            // Echo authoritative state even after rejection, so the client can
+            // restore a known instance instead of retaining unsaved coordinates.
+            reply.NewFurnitures.Add(BuildFurniture(owned));
+        }
+        var next = new HouseState { NextObjId = state.NextObjId,
+            Furniture = state.Furniture.Select(f => byId[f.ObjId]).ToList() };
+        if (!HousePlacementLimits.OutdoorLimit(_table, state, next)
+            || !HouseCollisionLimits.NoWorse(_table, state, next)
+            || _placementLimits is not null && !_placementLimits.WithinLimits(_table, state, next, cafeLevel))
+        {
+            Log.Warn($"[session {session.Id}] UpdateHouseReq layout limits exceeded; placement batch unchanged");
+            next = state;
+            acceptedLayout = false;
+            reply.NewFurnitures.Clear();
+            reply.NewFurnitures.AddRange(req.Furnitures.DistinctBy(f => f.ObjId)
+                .Where(f => byId.ContainsKey(f.ObjId))
+                .Select(f => BuildFurniture(state.Furniture.First(old => old.ObjId == f.ObjId))));
+        }
+        bool plansChanged = UpdatePlans(player, next, req, reply, session.Id, acceptedLayout);
+        if (WriteState(player, next) || plansChanged) _ctx?.Store.Save(player);
+        reply.NewRooms.AddRange(BuildResponse(player.Roleid, next, player).HouseInfo!.RoomList);
+        if (req.Rooms.Any(r => r.GirlIds.Count > 0))
+            Log.Warn($"[session {session.Id}] UpdateHouseReq legacy girls not applied by NCafe placement handler");
+        session.Send(SssjServer.Protocol.Pf.UpdateHouseRsp, packet.Serial, reply);
         return Task.CompletedTask;
     }
 
@@ -1038,7 +1110,7 @@ public sealed class HouseFeature : IGameFeature
     ///     <c>has_visitinfo</c> 为真时才走到（<c>0x1D68FB8</c>）⇒ <b>不带就 NRE</b>。</item>
     /// </list>
     /// </summary>
-    internal static GetHouseInfoRsp BuildResponse(ulong roleid, HouseState state)
+    internal static GetHouseInfoRsp BuildResponse(ulong roleid, HouseState state, Player? player = null)
     {
         var rsp = new GetHouseInfoRsp
         {
@@ -1076,9 +1148,9 @@ public sealed class HouseFeature : IGameFeature
             cache.RoomList.Add(room);
         }
 
-        // themeList / petList 留空，理由见类注释 §4。
-        // ★ decorationTheme 若要下发，templateThemeId 必须在 NCafeThemes.txt 的 49 条里
-        //   （NCafeTheme..ctor RVA 0x18004C0 → 0x180061C 无 nil 保护），所以宁可不发。
+        // TemplateThemeId=0 is the explicit custom-plan branch of NCafeTheme's
+        // constructor (0x18005C4 -> 0x180062C); it reads name/poses from protobuf.
+        if (player is not null) AddPlansToCache(player, cache);
         return rsp;
     }
 
@@ -1090,7 +1162,7 @@ public sealed class HouseFeature : IGameFeature
     /// f.objId      = item+0x10 Guid     // 0x1D6B93C        → 0x1D6B958 set_objId
     /// f.parentId   = item+0x14 Parent   // 0x1D6B95C        → 0x1D6B978 set_parentId
     /// f.roomId     = item+0x18 Room     // 0x1D6B97C        → 0x1D6B998 set_roomId
-    /// f.isNew      = (roomId != 0)      // 0x1D6B9AC cmp/cset ← ★ 客户端自己的 bug，复用了 roomId 的寄存器
+    /// f.isNew      = item.IsNew        // 0x1D6B99C ldrb [item,#0x2C], 0x1D6B9AC cmp/cset
     /// p.templateId       = item.Id      // 0x1D6B9E0        → 0x1D6BA00
     /// p.parentTemplateId = item+0x14    // 0x1D6BA04        → 0x1D6BA20   ← 与 f.parentId 同源
     /// p.posX/posY/rotate = item+0x1C/0x20/0x24              // 0x1D6BA40 / 0x1D6BA60 / 0x1D6BA80
@@ -1109,7 +1181,7 @@ public sealed class HouseFeature : IGameFeature
     /// 共享一个实例会让玩家挪动一件家具时静默污染另一件的位置。
     /// 下面每次调用都 <c>new objPose</c>，这条约束别在「优化分配」时被破坏。
     /// </summary>
-    private static furniture BuildFurniture(HouseFurniture f)
+    internal static furniture BuildFurniture(HouseFurniture f)
     {
         return new furniture
         {
@@ -1139,7 +1211,7 @@ public sealed class HouseFeature : IGameFeature
     // =================================================================
 
     /// <summary>
-    /// 读出本玩家的摆设；存档里没有（新号）或家具列表为空时，按
+    /// 读出本玩家的摆设；存档里没有（新号）时，按
     /// <c>Configure.txt</c> + <c>NCafeDefautItems.txt</c> <b>生成一份默认摆设</b>。
     ///
     /// 存档里的家具一律**先按 <c>NCafeItems.txt</c> 校验再下发**（理由见类注释 §3 第 2 条）：
@@ -1151,7 +1223,10 @@ public sealed class HouseFeature : IGameFeature
         var node = player.Extra.TryGetValue(ExtraKey, out var v) ? v as JsonObject : null;
         var stored = ReadFurniture(node?["furniturelist"] as JsonArray, table, sessionId);
 
-        if (stored.Count > 0)
+        // An explicitly saved empty inventory is valid (e.g. all items sold).
+        // Do not respawn default furniture or reset the instance allocator.
+        if (stored.Count > 0 || node?["furniturelist"] is JsonArray { Count: 0 }
+            && ReadUInt(node?["nextobjid"], 0) >= HouseTable.MinPlayerObjId)
         {
             uint next = ReadUInt(node?["nextobjid"], 0);
             // 存档里的 nextObjId 必须严格大于已用的最大玩家 objId，否则会分配出重复 id
@@ -1204,15 +1279,17 @@ public sealed class HouseFeature : IGameFeature
         var tpl = _table.ItemOf(MusicSceneTemplateId);
         var list = state.Furniture.ToList();
         uint next = state.NextObjId;
+        bool hasPlacedOutdoor = state.Furniture.Any(f => f.RoomId != 0 && f.ParentId != 0
+            && _table.ItemOf(f.TemplateId)?.Type == _table.OutDoorScene);
 
-        // ★ ParentId 取表里的 Parent 列（外景 → 22）。语义是**父物件的 objId**，
-        //   而系统家具的 objId == templateId（见 HouseTable.OutdoorObjId 的取证）
-        //   ⇒ 直接用表值即可，不能写 0（第十二轮那个「parentid=0 让客户端挂不上场景树」的真 bug）。
+        // Placed scenes need the configured container (22). When another outdoor
+        // is already placed, grant ownership in storage (room/parent 0), like a
+        // normal furniture reward; HasByMusicScene checks ownership, not placement.
         list.Add(new HouseFurniture(
             ObjId: next++,
             TemplateId: MusicSceneTemplateId,
-            RoomId: OutdoorRoomId,
-            ParentId: tpl?.Parent ?? 22u,
+            RoomId: hasPlacedOutdoor ? 0 : OutdoorRoomId,
+            ParentId: hasPlacedOutdoor ? 0u : tpl?.Parent ?? 22u,
             PosX: 0, PosY: 0, Rotate: 0,
             BizCount: 0,
             Status: 0));
@@ -1220,7 +1297,7 @@ public sealed class HouseFeature : IGameFeature
         WriteState(player, new HouseState { Furniture = list, NextObjId = next });
 
         Log.Info($"[session {session.Id}] GM 补发音乐节外景（templateId={MusicSceneTemplateId}"
-               + $" objId={next - 1} parent={tpl?.Parent ?? 22u}）⇒ 咖啡馆音游入口已打开");
+               + $" objId={next - 1} stored={hasPlacedOutdoor}）⇒ 咖啡馆音游入口已打开");
     }
 
     /// <summary>

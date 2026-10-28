@@ -151,6 +151,13 @@ public sealed class CardFeature : IGameFeature
         _ctx = ctx;
         _cards = CardTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
         _templates = ctx.CharacterCards;
+        ctx.OnPlayerPrepare((session, player) =>
+        {
+            bool changed = false;
+            foreach (var item in player.Items)
+                changed |= CardRefitCollection.Mark(player, item, _cards, _templates).HasValue;
+            if (changed) ctx.Store.Save(player);
+        });
 
         ctx.MapLuaCall(DecomposeCmd, OnDecompose);
         ctx.MapLuaCall(LevelUpCommonCmd, OnLevelUpCommon);
@@ -282,9 +289,18 @@ public sealed class CardFeature : IGameFeature
     /// 必须用 <see cref="CardTable.DecodeExpItem"/> 反查回 GDPL 才能扣对道具。
     /// 这是本域最容易写错的一处。
     ///
-    /// <para>★ 同名卡素材只加技能等级（技能体系本服未实现）⇒ 按「不产生经验」处理并记日志。</para>
+    /// <para>★ 同名卡素材只增加技能提升次数，不产生角色等级经验。</para>
     /// </summary>
     private Task OnLevelUpCommon(ClientSession session, int cmd, JsonNode? param)
+    {
+        if (session.Tag is Player player)
+        {
+            lock (player) return LevelUpCommonLocked(session, cmd, param);
+        }
+        return Task.CompletedTask;
+    }
+
+    private Task LevelUpCommonLocked(ClientSession session, int cmd, JsonNode? param)
     {
         if (session.Tag is not Player player)
         {
@@ -293,9 +309,9 @@ public sealed class CardFeature : IGameFeature
         }
 
         var obj = param as JsonObject;
-        uint guid = ReadUInt(obj?["guid"]);
+        uint guid = obj?["guid"] is JsonValue value && value.TryGetValue<uint>(out var parsedGuid) ? parsedGuid : 0;
         var target = guid == 0 ? null : player.Items.FirstOrDefault(i => i.Guid == guid);
-        if (target is null || target.Genre != CardGenre)
+        if (target is null || target.Count == 0 || target.Genre != CardGenre)
         {
             Log.Warn($"[session {session.Id}] Card_LevelUpCommon(5) 目标卡 guid={guid} 不存在或不是角色卡");
             return Fail(session, LevelUpCommonCmd, ErrKeyNotExists);
@@ -318,6 +334,7 @@ public sealed class CardFeature : IGameFeature
 
         long gain = 0;
         int sameNameCards = 0, skillCookies = 0;
+        long skillPoints = 0;
         var changed = new List<Item>();
         var removed = new List<Item>();
 
@@ -331,6 +348,18 @@ public sealed class CardFeature : IGameFeature
                      $"超过客户端上限 {MaxMaterialEntries}（UI_CardMain.lua:21），拒绝");
             return Fail(session, LevelUpCommonCmd, ErrKeyNotEnough);
         }
+
+        long goldCost = UpgradeGoldCost(player, target, materials);
+        if (goldCost < 0 || goldCost > int.MaxValue || player.GetMoney(GoldMoneyId) < goldCost)
+            return Fail(session, LevelUpCommonCmd, ErrKeyNotEnough);
+
+        bool hasSkillMaterial = materials.Any(m => m.Num > 0 &&
+            (m.Itype != ItemTypeCard ? CardTable.IsSkillCookie(m.Id) : player.Items.Any(i =>
+                i.Guid == (uint)m.Id && i.Guid != target.Guid && i.Genre == target.Genre &&
+                i.Detail == target.Detail && i.Particular == target.Particular && i.Level == target.Level)));
+        var targetTemplate = _templates.Get(target.Genre, target.Detail, target.Particular, target.Level);
+        if (hasSkillMaterial && CardSkills.Remaining(target, targetTemplate) == 0)
+            return Fail(session, LevelUpCommonCmd, ErrKeyNotEnough);
 
         foreach (var (itype, id, num) in materials)
         {
@@ -368,11 +397,12 @@ public sealed class CardFeature : IGameFeature
                 }
 
                 // ★ 同名卡（GDPL 四元全等）只加技能等级，不产生经验
-                //   取证 UI_CardMain.lua:1999..2021；技能等级体系本服未实现。
+                //   取证 UI_CardMain.lua:1999..2021；额外继承素材已有的技能提升。
                 if (mat.Genre == target.Genre && mat.Detail == target.Detail &&
                     mat.Particular == target.Particular && mat.Level == target.Level)
                 {
                     sameNameCards++;
+                    skillPoints += CardSkills.FeedPoints(mat, targetTemplate);
                 }
                 else
                 {
@@ -404,6 +434,7 @@ public sealed class CardFeature : IGameFeature
             {
                 // 技能饼干加的是技能经验（GetEnhanceCardExp 的 else 分支 return count）
                 skillCookies += took;
+                skillPoints += took;
                 continue;
             }
 
@@ -422,6 +453,8 @@ public sealed class CardFeature : IGameFeature
         var (newLv, newExp) = _cards.ApplyExp(oldLv, target.EnhanceExp, gain, maxLevel);
         target.EnhanceLevel = (uint)newLv;
         target.EnhanceExp = (uint)Math.Min(newExp, uint.MaxValue);
+        CardSkills.Apply(target, targetTemplate, skillPoints);
+        player.AddMoney(GoldMoneyId, -(int)goldCost);
         if (!changed.Contains(target))
             changed.Add(target);
 
@@ -431,13 +464,15 @@ public sealed class CardFeature : IGameFeature
                  $"LV.{oldLv} → LV.{newLv}（+{gain} 经验，残余 {target.EnhanceExp}，上限 {maxLevel}" +
                  $"／突破 {target.BreakLevel} 次、type={breakType}）；" +
                  $"消耗素材：卡 {removed.Count(i => i.Genre == CardGenre)} 张" +
-                 $"（其中同名卡 {sameNameCards} 张只加技能，本服未实现）、" +
+                 $"（其中同名卡 {sameNameCards} 张只加技能，技能提升点数 {skillPoints}）、" +
                  $"道具 {changed.Count(i => i.Genre != CardGenre)} 种、技能饼干 {skillCookies} 个");
 
         // ★ 先推 1031，再回包（类注释 §2）
         if (removed.Count > 0)
             GameNotify.PushItemsRemoved(session, removed);
         GameNotify.PushItems(session, changed);
+
+        if (goldCost > 0) GameNotify.PushMoney(session, player, GoldMoneyId);
 
         // ★ 成功回包**绝不能带 errorKey**（Lua 真值判断）
         _ctx?.LuaCalls.CallClient(session, LevelUpCommonCmd, new JsonObject());
@@ -455,19 +490,31 @@ public sealed class CardFeature : IGameFeature
     /// </summary>
     private Task OnBreak(ClientSession session, int cmd, JsonNode? param)
     {
+        if (session.Tag is Player player)
+        {
+            lock (player) return BreakLocked(session, cmd, param);
+        }
+        return Task.CompletedTask;
+    }
+
+    private Task BreakLocked(ClientSession session, int cmd, JsonNode? param)
+    {
         if (session.Tag is not Player player)
         {
             Log.Warn($"[session {session.Id}] Card_Break(6) 到达但会话未登录，忽略");
             return Task.CompletedTask;
         }
 
-        uint guid = ReadUInt((param as JsonObject)?["guid"]);
+        uint guid = (param as JsonObject)?["guid"] is JsonValue value && value.TryGetValue<uint>(out var parsedGuid) ? parsedGuid : 0;
         var target = guid == 0 ? null : player.Items.FirstOrDefault(i => i.Guid == guid);
-        if (target is null || target.Genre != CardGenre)
+        if (target is null || target.Count == 0 || target.Genre != CardGenre)
         {
             Log.Warn($"[session {session.Id}] Card_Break(6) 目标卡 guid={guid} 不存在或不是角色卡，不回包");
             return Task.CompletedTask;
         }
+
+        // P=17 growth is awarded by completed pledge stages, not ordinary materials.
+        if (target.Particular == PldgeCardParticular) return Task.CompletedTask;
 
         int rarity = RarityOf(target);
         int breakType = BreakTypeOf(target);
@@ -494,7 +541,7 @@ public sealed class CardFeature : IGameFeature
         }
         foreach (var need in step.Items)
         {
-            int have = CountByTemplate(player, (uint)need.G, (uint)need.D, (uint)need.P, (uint)need.L);
+            long have = CountByTemplate(player, (uint)need.G, (uint)need.D, (uint)need.P, (uint)need.L);
             if (have < need.N)
             {
                 Log.Warn($"[session {session.Id}] Card_Break(6) 材料不足：" +
@@ -570,13 +617,21 @@ public sealed class CardFeature : IGameFeature
     ///   <item><b>材料</b>：<c>:2459..2473</c> 逐项 <c>num &lt; n</c> 即不足；</item>
     ///   <item><b>同步率</b>：<c>:2451</c> <c>SyncRate &gt;= RefitSync&lt;n&gt;</c>（单位千分之一）。</item>
     /// </list>
-    /// ★ <b>任务前置（<c>MissionId</c>）本服不校验</b>：客户端判据是
+    /// ★ <b>任务前置（<c>MissionId</c>）</b>：客户端判据是
     /// <c>MissionManager:GetOtherAchieve(id)</c> + <c>CheckInfoState(conf, 3)</c>
-    /// （<c>:2490..2494</c>），而「其它成就」的完成度语义本服未逐类取证（§29 那条同源缺口）。
-    /// 宁可放行也不要误拒 —— 客户端**自己已经拦过一道**（按钮置灰、不发包），
-    /// 能走到服务端的基本都是合法请求。
+    /// （<c>:2490..2494</c>）。按原表assistparam选择阈值，group18任务值右移1位为进度；
+    /// 达标或已领取均可改造，不在改造时领取奖励或消耗任务进度。
     /// </summary>
     private Task OnRefit(ClientSession session, int cmd, JsonNode? param)
+    {
+        if (session.Tag is Player player)
+        {
+            lock (player) return RefitLocked(session, cmd, param);
+        }
+        return Task.CompletedTask;
+    }
+
+    private Task RefitLocked(ClientSession session, int cmd, JsonNode? param)
     {
         if (session.Tag is not Player player)
         {
@@ -585,11 +640,15 @@ public sealed class CardFeature : IGameFeature
         }
 
         var body = param as JsonObject;
-        uint guid = ReadUInt(body?["guid"]);
-        int want = (int)ReadUInt(body?["refitNum"]);
+        if (body?["guid"] is not JsonValue guidValue || !guidValue.TryGetValue<uint>(out uint guid) || guid == 0 ||
+            !GachaRequestLimits.TryInteger(body?["refitNum"], out int want) || want <= 0)
+        {
+            Log.Warn($"[session {session.Id}] Card_Refit(8) 参数不是有效整数，不回包");
+            return Task.CompletedTask;
+        }
 
         var target = guid == 0 ? null : player.Items.FirstOrDefault(i => i.Guid == guid);
-        if (target is null || target.Genre != CardGenre)
+        if (target is null || target.Count == 0 || target.Genre != CardGenre)
         {
             Log.Warn($"[session {session.Id}] Card_Refit(8) 目标卡 guid={guid} 不存在或不是角色卡，不回包");
             return Task.CompletedTask;
@@ -621,6 +680,17 @@ public sealed class CardFeature : IGameFeature
         }
 
         var step = row.Steps[next - 1];
+        if (step.MissionId > 0)
+        {
+            var mission = _ctx?.Missions.GetAchieveOther(step.MissionId);
+            if (mission is null || Math.Max(MissionFeature.ProgressOf(player.GetTask(mission.Group, mission.Id)),
+                MissionFeature.DerivedProgress(player, mission)) <
+                mission.RequiredCount(achieveKey: true))
+            {
+                Log.Warn($"[session {session.Id}] Card_Refit(8) guid={guid} 前置成就 {step.MissionId} 未达标或缺少配置，不回包");
+                return Task.CompletedTask;
+            }
+        }
         var cost = row.Cost?.Steps.Count >= next ? row.Cost.Steps[next - 1] : null;
         if (cost is null)
         {
@@ -648,7 +718,7 @@ public sealed class CardFeature : IGameFeature
         // ④ 材料
         foreach (var need in cost.Items)
         {
-            int have = CountByTemplate(player, (uint)need.G, (uint)need.D, (uint)need.P, (uint)need.L);
+            long have = CountByTemplate(player, (uint)need.G, (uint)need.D, (uint)need.P, (uint)need.L);
             if (have < need.N)
             {
                 Log.Warn($"[session {session.Id}] Card_Refit(8) 材料不足："
@@ -668,6 +738,7 @@ public sealed class CardFeature : IGameFeature
             player.AddMoney(cost.CurrencyId, -cost.CurrencyCount);
 
         target.RefitNum = (uint)next;
+        var refitCollection = CardRefitCollection.Mark(player, target, _cards, _templates);
         if (!changed.Contains(target))
             changed.Add(target);
 
@@ -684,6 +755,8 @@ public sealed class CardFeature : IGameFeature
         GameNotify.PushItems(session, changed);
         if (cost.CurrencyCount > 0)
             GameNotify.PushMoney(session, player, cost.CurrencyId);
+
+        if (refitCollection is { } task) GameNotify.PushTaskValues(session, new[] { task });
 
         // ★ 与突破同族：成功必须带 ok
         _ctx?.LuaCalls.CallClient(session, RefitCmd, new JsonObject { ["ok"] = true });
@@ -731,11 +804,54 @@ public sealed class CardFeature : IGameFeature
         return long.TryParse(tpl.ExtParam1, out long v) ? v : 0;
     }
 
+    // UI_CardMain.GetSelectCost: cards use CoinCostRate(1) * rarity base;
+    // material items use ExtParam2. Simulate consumption so repeated entries
+    // and locked stacks are charged only for the quantities actually consumed.
+    private long UpgradeGoldCost(Player player, Item target, List<(int Itype, int Id, int Num)> materials)
+    {
+        long cost = 0;
+        var cards = new HashSet<uint>();
+        var remaining = player.Items.ToDictionary(i => i.Guid, i => (long)i.Count);
+        foreach (var (type, id, num) in materials)
+        {
+            if (num <= 0) continue;
+            if (type == ItemTypeCard)
+            {
+                var item = player.Items.FirstOrDefault(i => i.Guid == (uint)id);
+                if (item is null || item.Genre != CardGenre || item.Guid == target.Guid ||
+                    item.Particular == PldgeCardParticular || BagFeature.CheckSellable(player, item) != 0 ||
+                    !cards.Add(item.Guid)) continue;
+                cost += _cards.RarityFeedBaseExp(RarityOf(item));
+                continue;
+            }
+            var gdpl = CardTable.DecodeExpItem(id);
+            if (id == 0 || gdpl is null) continue;
+            var (g, d, p, l) = gdpl.Value;
+            var template = _ctx?.ItemTemplates.Get((uint)g, (uint)d, (uint)p, (uint)l);
+            long unit = 0;
+            if (template is null || (template.ExtParam2.Length > 0 &&
+                (!long.TryParse(template.ExtParam2, out unit) || unit < 0))) return -1;
+            long want = num;
+            foreach (var item in player.Items.Where(i => i.Genre == g && i.Detail == d &&
+                i.Particular == p && i.Level == l && i.LockOn == 0).OrderBy(i => i.CreateTime).ThenBy(i => i.Guid))
+            {
+                long use = Math.Min(want, remaining[item.Guid]);
+                remaining[item.Guid] -= use;
+                want -= use;
+                if (unit > int.MaxValue || cost > int.MaxValue - use * unit) return -1;
+                cost += use * unit;
+                if (want == 0) break;
+            }
+        }
+        return cost;
+    }
+
     /// <summary>按模板统计持有数量（跨实例累加 count）。</summary>
-    private static int CountByTemplate(Player player, uint g, uint d, uint p, uint l)
+    private static long CountByTemplate(Player player, uint g, uint d, uint p, uint l)
         => player.Items
             .Where(i => i.Genre == g && i.Detail == d && i.Particular == p && i.Level == l)
-            .Sum(i => (int)i.Count);
+            .Where(i => i.LockOn == 0)
+            .Sum(i => (long)i.Count);
 
     /// <summary>
     /// 按模板扣 <paramref name="want"/> 个，返回实际扣到的数量。
@@ -757,7 +873,7 @@ public sealed class CardFeature : IGameFeature
         {
             if (taken >= want)
                 break;
-            uint use = (uint)Math.Min(want - taken, (int)item.Count);
+            uint use = (uint)Math.Min((long)want - taken, item.Count);
             if (use == 0)
                 continue;
             if (use >= item.Count)

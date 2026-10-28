@@ -258,7 +258,7 @@ public class EquipItemNotifyTests
     // ================== 非装备 genre 的门控 ==================
 
     /// <summary>
-    /// ★ 非装备 genre（角色卡 1 / 道具 5）一律不带这四个字段。
+    /// ★ 非装备 genre 不带武器槽、属性和宿主字段；角色卡仍需传输自己的 MiniSkill。
     /// genre 5 分支只读 6 个标量、无任何 Clear（<c>0x1D9B168..0x1D9B2BC</c>）；
     /// 角色卡走 <c>AddCharacterCard</c> 另一套（<c>syncrate</c>/<c>refitnum</c>）。
     /// </summary>
@@ -277,7 +277,13 @@ public class EquipItemNotifyTests
 
         var info = GameNotify.BuildItemInfo(it);
 
-        Assert.Empty(info.Skillinfo);
+        if (genre == GenreCard)
+        {
+            var skill = Assert.Single(info.Skillinfo);
+            Assert.Equal(1u, skill.Skillid);
+            Assert.Equal(2, skill.Skilltype);
+        }
+        else Assert.Empty(info.Skillinfo);
         Assert.Null(info.Weaponinlay);
         Assert.Empty(info.Attrlist);
         Assert.Equal(0u, info.Ownguid);

@@ -142,8 +142,23 @@ public sealed class MailFeature : IGameFeature
         {
             var mails = Load(player);
             SeedIfEmpty(player, mails);
+            if (EnsureProducerMail(player, mails)) { Save(player, mails); ctx.Store.Save(player); }
             PushList(session, mails);
         });
+    }
+
+    internal const string ProducerNotice = "制作人：SteveS，勿擅自转发";
+    internal static bool EnsureProducerMail(Player player, List<MailEntry> mails)
+    {
+        const string flag = "producerNoticeSteveS20261028";
+        if (player.Extra.TryGetValue(flag, out var sent) && sent?.GetValue<bool>() == true) return false;
+        mails.Add(new MailEntry {
+            Id = mails.Count == 0 ? 1 : mails.Max(m => m.Id) + 1,
+            RecvTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            Title = "制作人声明", Sender = "SteveS", Content = ProducerNotice, ExpiryTime = 0,
+        });
+        player.Extra[flag] = true;
+        return true;
     }
 
     // =================================================================

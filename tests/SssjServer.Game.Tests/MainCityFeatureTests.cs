@@ -337,8 +337,12 @@ public class MainCityFeatureIntegrationTests : IAsyncLifetime
             //    ★ 用 ReadPacketOfPfAsync：功能域的登录钩子（GameModule.HandleLogin 第 ⑥ 步）
             //    会在基础包之后继续推自己那部分（例如聊天域的 pf 1012 系统欢迎语），
             //    数量随新功能域增长；沿途跳过的包照样解密以推进 CBC 链（AGENTS.md §2.3）。
-            var ntfCallPkt = await ReadPacketOfPfAsync(stream, crypto, GamePf.NtfS2CCall);
-            var ntfCall = ProtoMessage.Parse<NtfS2CCall>(crypto.Decrypt(ntfCallPkt.Payload));
+            NtfS2CCall ntfCall;
+            do
+            {
+                var ntfCallPkt = await ReadPacketOfPfAsync(stream, crypto, GamePf.NtfS2CCall);
+                ntfCall = ProtoMessage.Parse<NtfS2CCall>(crypto.Decrypt(ntfCallPkt.Payload));
+            } while (JsonNode.Parse(ntfCall.SJsonParam)!["sCmd"]!.GetValue<int>() == 999999);
             Assert.Equal("LuaCall", ntfCall.SFunction);
 
             var root = JsonNode.Parse(ntfCall.SJsonParam)!;

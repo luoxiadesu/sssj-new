@@ -67,10 +67,14 @@ public class WeaponForgeFeatureTests
             $"池 1 只有 {table.Segments(OpenPoolId).Count} 段档期 —— 多段被覆盖了？");
 
         var open = table.OpenAt(now).ToList();
-        Assert.Single(open);                       // 现网只有池 1 开着
-        Assert.Equal(OpenPoolId, open[0].Id);
+        var plan = GachaRotation.For(TestPaths.SettingDir).Read();
+        if (plan.Enabled)
+            Assert.Equal(plan.Entries.Where(e => e.Type == 0 && e.Start <= now && now < e.End)
+                .Select(e => e.Id).Distinct().OrderBy(x => x), open.Select(p => p.Id).OrderBy(x => x));
+        else
+            Assert.Equal(OpenPoolId, Assert.Single(open).Id);
 
-        var pool = open[0];
+        var pool = open.Single(p => p.Id == OpenPoolId);
         Assert.Equal(0, pool.CashType);             // 用道具抽
         Assert.Equal(0, pool.JudgeType);            // 不是自选 UP 池
         Assert.Equal(3, pool.CardStarSeedId);       // 真机自报 seed=3
@@ -85,7 +89,7 @@ public class WeaponForgeFeatureTests
 
         // 过期池：存在但取不到当前档期
         Assert.True(table.Exists(ExpiredPoolId));
-        Assert.Null(table.Get(ExpiredPoolId, now));
+        if (!plan.Enabled) Assert.Null(table.Get(ExpiredPoolId, now));
     }
 
     /// <summary>
@@ -387,6 +391,12 @@ public class WeaponForgeFeatureTests
     public async Task Forge_ExpiredPool_RepliesPoolClosedCode()
     {
         using var h = await FeatureHarness.CreateAsync("wforge-expired");
+        // 本地全池轮换已经开放池 2；其合法档期不应再按旧快照拒绝。
+        if (GachaRotation.For(TestPaths.SettingDir).Read().Enabled)
+        {
+            Assert.NotNull(WeaponGachaTable.Load(TestPaths.SettingDir).Get(ExpiredPoolId, DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
+            return;
+        }
         h.Player.AddItem(OneG, OneD, OneP, OneL, count: 5);
 
         await SendAsync(h, Forge(ExpiredPoolId, ten: false));

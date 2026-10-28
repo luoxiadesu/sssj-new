@@ -53,13 +53,21 @@ public sealed class ActivityAchieveTable
                 t._byActivity[id] = list;
         }
 
-        Log.Info($"[setting] 活动成就配置：{t._byActivity.Count} 个 Template=2 活动、" +
+        // Restored tower 21 uses Template5, with permanent and daily achievement lists.
+        var towerTasks = SettingTable.Load(Path.Combine(settingDir, "ActivityTemplate5.txt"));
+        if (towerTasks is not null)
+            foreach (var row in towerTasks.Rows)
+                if (towerTasks.Int(row, "Id") == 262)
+                    t._byActivity[262] = ParseBraceList(towerTasks.Str(row, "AchievementList"))
+                        .Concat(ParseBraceList(towerTasks.Str(row, "DailyAchievementList"))).Distinct().ToList();
+
+        Log.Info($"[setting] 活动成就配置：{t._byActivity.Count} 个活动映射（含重开262）、" +
                  $"共 {t._byActivity.Values.Sum(l => l.Count)} 条成就" +
                  $"（现网开放的是 2/3/14/15/16/108）");
         return t;
     }
 
-    /// <summary>该活动的成就 id 列表；不是 Template=2 活动时返回空。</summary>
+    /// <summary>该活动的成就 id 列表；未登记活动返回空。</summary>
     public IReadOnlyList<int> AchievesOf(int activityId)
         => _byActivity.TryGetValue(activityId, out var l) ? l : Array.Empty<int>();
 

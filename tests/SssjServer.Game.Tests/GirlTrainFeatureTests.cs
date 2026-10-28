@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+﻿using System.Text.Json.Nodes;
 using SssjServer.Game.Config;
 using SssjServer.Game.Handlers;
 using Xunit;
@@ -16,6 +16,185 @@ namespace SssjServer.Game.Tests;
 /// </summary>
 public class GirlTrainFeatureTests
 {
+    [Fact]
+    public async Task OwnedUnplacedOutdoorImprovesRewardButUnownedOutdoorDoesNot()
+    {
+        using var h = await FeatureHarness.CreateAsync("train-owned-best");
+        // Owning an outdoor in storage is sufficient; it need not be equipped.
+        HouseFeature.WriteState(h.Player, new HouseState
+        {
+            Furniture = new() { new HouseFurniture(1000, 1400, 0, 0, 0, 0, 0, 0, 0) },
+            NextObjId = 1001,
+        });
+        var girl = h.Player.GetGirl(1)!;
+        girl.Level = 100;
+        girl.Exp = 0;
+        h.Player.SetTask(3, GirlTrainFeature.VarTrainPos, 11);
+        h.Player.SetTask(3, GirlTrainFeature.VarTrainTime, 1);
+        h.Player.SetTask(3, GirlTrainFeature.VarTrainOutId, 72);
+        await SendAsync(h, GirlTrainFeature.CmdEndTrain, "\"nId\":1");
+        Assert.Null(Reply(h)["nError"]);
+        Assert.Equal(72u, girl.Exp);
+        Assert.Equal(1300, Reply(h)["nMoney"]![4]!.GetValue<int>());
+        // Shared table data must remain untouched by per-player maxima.
+        var train = TrainTable.Load(TestPaths.SettingDir);
+        Assert.Equal(60, train.TrainingFor(72, 1)!.LoveAward);
+        Assert.Equal(1000, train.TrainingFor(72, 1)!.PlayerAwards[0][4]);
+    }
+
+    [Theory]
+    [InlineData(1, true)]
+    [InlineData(1, false)]
+    [InlineData(201, true)]
+    [InlineData(201, false)]
+    public async Task TrainingOverflowSurvivesCapAndReloadAndCannotBeClaimedTwice(int id, bool alreadyMax)
+    {
+        using var h = await FeatureHarness.CreateAsync("train-overflow-" + id + alreadyMax);
+        uint girlId = (uint)id;
+        if (h.Player.GetGirl(girlId) is null) h.Player.Girls.Add(new Girl { Girlid = girlId });
+        var girl = h.Player.GetGirl(girlId)!;
+        var love = GirlLoveTable.Load(TestPaths.SettingDir);
+        int cap = love.MaxLevel(girlId);
+        girl.Level = (uint)(alreadyMax ? cap : cap - 1);
+        girl.Exp = alreadyMax ? 2990u : (uint)(love.LevelUpExp(girlId, cap - 1) - 1);
+        int group = GirlLoveFeature.VarGroup(girlId);
+        foreach (var pair in new[] { (11, 11), (12, 1), (16, 72) })
+            h.Player.SetTask(group, GirlLoveFeature.VarTaskId(girlId, pair.Item1), pair.Item2);
+        await SendAsync(h, GirlTrainFeature.CmdEndTrain, $"\"nId\":{id}");
+        Assert.Null(Reply(h)["nError"]);
+        Assert.Equal((uint)cap, girl.Level);
+        Assert.Equal(alreadyMax ? 3050u : 59u, girl.Exp);
+        Assert.Equal(60, Reply(h)["AddExpInfo"]![0]!.GetValue<int>());
+        Assert.Equal(girl.Exp, new PlayerStore(h.Options).Load(h.Player.Account)!.GetGirl(girlId)!.Exp);
+        uint saved = girl.Exp;
+        await SendAsync(h, GirlTrainFeature.CmdEndTrain, $"\"nId\":{id}");
+        Assert.NotNull(Reply(h)["nError"]);
+        Assert.Equal(saved, girl.Exp);
+    }
+
+    [Fact]
+    public async Task TrainingUsesEquippedOutdoorAndKeepsItsRewardAfterSwitch()
+    {
+        using var h = await FeatureHarness.CreateAsync("train-outdoor-reward");
+        var house = HouseTable.Load(TestPaths.SettingDir);
+        Assert.Equal(72, GirlTrainFeature.CurrentOutdoor(h.Player, house));
+        await SendAsync(h, GirlTrainFeature.CmdStartTrain, "\"nId\":1,\"nPos\":11");
+        Assert.Null(Reply(h)["nError"]);
+        Assert.Equal(72, GirlTrainFeature.GetVar(h.Player, 1, GirlTrainFeature.VarTrainOutId));
+        await SendAsync(h, GirlTrainFeature.CmdInterruptTrain, "\"nId\":1");
+        HouseFeature.WriteState(h.Player, new HouseState
+        {
+            Furniture = new() { new HouseFurniture(1000, 1000, 5, 22, 0, 0, 0, 0, 0) },
+            NextObjId = 1001,
+        });
+        Assert.Equal(1000, GirlTrainFeature.CurrentOutdoor(h.Player, house));
+        await SendAsync(h, GirlTrainFeature.CmdStartTrain, "\"nId\":1,\"nPos\":11");
+        Assert.Null(Reply(h)["nError"]);
+        Assert.Equal(1000, GirlTrainFeature.GetVar(h.Player, 1, GirlTrainFeature.VarTrainOutId));
+        // Switch back while training: completion must retain outdoor 1000's 70 affection.
+        HouseFeature.WriteState(h.Player, new HouseState
+        {
+            Furniture = new() { new HouseFurniture(1000, 1000, 0, 0, 0, 0, 0, 0, 0) },
+            NextObjId = 1001,
+        });
+        Assert.Equal(72, GirlTrainFeature.CurrentOutdoor(h.Player, house));
+        h.Player.SetTask(3, GirlTrainFeature.VarTrainTime, 1);
+        h.Player.GetGirl(1)!.Level = 1;
+        h.Player.GetGirl(1)!.Exp = 0;
+        await SendAsync(h, GirlTrainFeature.CmdEndTrain, "\"nId\":1");
+        Assert.Null(Reply(h)["nError"]);
+        Assert.Equal(70, Reply(h)["AddExpInfo"]![0]!.GetValue<int>());
+        // Outdoor 1000 improves love (70), default 72 improves currency (1000 vs 800).
+        Assert.Equal(1000, Reply(h)["nMoney"]![4]!.GetValue<int>());
+    }
+
+    [Fact]
+    public void TrainingDoesNotBorrowRewardsFromAnotherOutdoor()
+    {
+        var train = TrainTable.Load(TestPaths.SettingDir);
+        Assert.Equal(60, train.TrainingFor(72, 1)!.LoveAward);
+        Assert.Equal(70, train.TrainingFor(1000, 1)!.LoveAward);
+        Assert.Null(train.TrainingFor(int.MaxValue, 1));
+        Assert.NotNull(train.TrainingFor(1400, 1));
+    }
+
+    [Fact]
+    public async Task EndTrainActuallyAddsAffectionUnlocksStoryAndCannotClaimTwice()
+    {
+        using var h = await FeatureHarness.CreateAsync("train-affection-fix");
+        var table = GirlLoveTable.Load(TestPaths.SettingDir);
+        var girl = h.Player.GetGirl(1)!;
+        girl.Level = 9;
+        girl.Exp = (uint)(table.LevelUpExp(1, 9) - 1);
+        var train = TrainTable.Load(TestPaths.SettingDir);
+        var slot = train.PosOf(11)!;
+        int storyTask = GirlLoveFeature.VarTaskId(1, GirlLoveFeature.ELevelOffset(5));
+        h.Player.SetTask(3, storyTask, 0);
+        h.Player.SetTask(3, GirlTrainFeature.VarTrainPos, 11);
+        h.Player.SetTask(3, GirlTrainFeature.VarTrainTime, 1);
+        h.Player.SetTask(3, GirlTrainFeature.VarTrainOutId, slot.OutdoorId);
+        await SendAsync(h, GirlTrainFeature.CmdEndTrain, "\"nId\":1");
+        var reply = Reply(h);
+        Assert.Null(reply["nError"]);
+        Assert.Equal(5, Assert.IsType<JsonArray>(reply["AddExpInfo"]).Count);
+        Assert.Equal(5, Assert.IsType<JsonArray>(reply["nMoney"]).Count);
+        Assert.True(girl.Level >= 10);
+        Assert.Equal(1, h.Player.GetTask(3, storyTask));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(girl.Exp, saved.GetGirl(1)!.Exp);
+        Assert.Equal(1, saved.GetTask(3, storyTask));
+        uint after = girl.Exp;
+        await SendAsync(h, GirlTrainFeature.CmdEndTrain, "\"nId\":1");
+        Assert.NotNull(Reply(h)["nError"]);
+        Assert.Equal(after, girl.Exp);
+    }
+
+    [Fact]
+    public async Task LinkGirlTrainingUsesGroup90AndDoesNotTouchOrdinaryGirl()
+    {
+        using var h = await FeatureHarness.CreateAsync("link-train-vars");
+        h.Player.Girls.Add(new Girl { Girlid = 201, Level = 1 });
+        int pos = TrainTable.Load(TestPaths.SettingDir).Positions.Keys.First();
+        int linkTask = GirlLoveFeature.VarTaskId(201, GirlTrainFeature.VarTrainPos);
+        h.Player.SetTask(3, GirlTrainFeature.VarTrainPos, 777);
+        await SendAsync(h, GirlTrainFeature.CmdStartTrain, $"\"nId\":201,\"nPos\":{pos}");
+        Assert.Null(Reply(h)["nError"]);
+        Assert.Equal(pos, h.Player.GetTask(90, linkTask));
+        Assert.Equal(777, h.Player.GetTask(3, GirlTrainFeature.VarTrainPos));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(pos, saved.GetTask(90, linkTask));
+        await SendAsync(h, GirlTrainFeature.CmdInterruptTrain, "\"nId\":201");
+        Assert.Null(Reply(h)["nError"]);
+        Assert.Equal(0, h.Player.GetTask(90, linkTask));
+        Assert.Equal(777, h.Player.GetTask(3, GirlTrainFeature.VarTrainPos));
+    }
+
+    [Fact]
+    public async Task TrainingCannotExceedCafeCapacityAndFailedStartKeepsState()
+    {
+        using var h = await FeatureHarness.CreateAsync("training-total-cap");
+        int cap = CafeTable.Load(TestPaths.SettingDir).LevelRowFor(1)!.OpenTrain;
+        Assert.Equal(4, cap);
+        int[] positions = { 11, 12, 13, 21, 22 };
+        for (uint id = 1; id <= 5; id++)
+            if (h.Player.GetGirl(id) is null) h.Player.Girls.Add(new Girl { Girlid = id, Level = 1 });
+        var girls = Enumerable.Range(1, 5).Select(id => h.Player.GetGirl((uint)id)!).ToList();
+        for (int i = 0; i < 4; i++)
+        {
+            await SendAsync(h, GirlTrainFeature.CmdStartTrain,
+                $"\"nId\":{girls[i].Girlid},\"nPos\":{positions[i]}");
+            Assert.Null(Reply(h)["nError"]);
+        }
+        await SendAsync(h, GirlTrainFeature.CmdStartTrain,
+            $"\"nId\":{girls[4].Girlid},\"nPos\":{positions[4]}");
+        Assert.NotNull(Reply(h)["nError"]);
+        Assert.Equal(0, GirlTrainFeature.GetVar(h.Player, girls[4].Girlid, GirlTrainFeature.VarTrainPos));
+        await SendAsync(h, GirlTrainFeature.CmdInterruptTrain, $"\"nId\":{girls[0].Girlid}");
+        await SendAsync(h, GirlTrainFeature.CmdStartTrain,
+            $"\"nId\":{girls[4].Girlid},\"nPos\":{positions[4]}");
+        Assert.Null(Reply(h)["nError"]);
+    }
+
     private static JsonObject Reply(FeatureHarness h)
     {
         var (function, json) = h.LastOutbound;

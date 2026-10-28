@@ -239,15 +239,21 @@ public sealed class CafeBizFeature : IGameFeature
     public const int MaxCoffeeKinds = 4;
 
     private GameFeatureContext _ctx = null!;
+    private GirlMoodRecovery _mood = null!;
     private CafeTable _cafe = CafeTable.Empty;
+    private HouseTable _house = HouseTable.Empty;
 
     public string Name => "咖啡馆经营（LuaCall 113 排班 / 114 座位 / 115 顾客 / 119 咖啡）";
 
     public void Install(GameFeatureContext ctx)
     {
         _ctx = ctx;
+        _mood = new GirlMoodRecovery(Path.GetFullPath(ctx.Options.SettingDirectory));
         _cafe = CafeTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
+        _house = HouseTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
 
+        ctx.OnPlayerPrepare((session, player) => RefreshCoffeeConditions(player));
+        ctx.BeforeCafeDownload += SettleElapsedSeats;
         ctx.MapLuaCall(SetWaiterListCmd, OnSetWaiterList);
         ctx.MapLuaCall(UpdateSeatListCmd, OnUpdateSeatList);
         ctx.MapLuaCall(GenCustomerCmd, OnGenCustomer);
@@ -263,6 +269,59 @@ public sealed class CafeBizFeature : IGameFeature
         ctx.MapLuaCall(GetMaxHotRewardCmd, OnGetMaxHotReward);
         ctx.MapLuaCall(GetBirthdayRewardCmd, OnGetBirthdayReward);
         ctx.MapLuaCall(GetMaxExpRewardCmd, OnGetMaxExpReward);
+    }
+
+    internal List<KeyValuePair<uint, int>> RefreshCoffeeConditions(Player player)
+        => RefreshCoffeeConditions(_cafe, player);
+
+    internal static List<KeyValuePair<uint, int>> RefreshCoffeeConditions(CafeTable cafe, Player player)
+    {
+        var changes = new List<KeyValuePair<uint, int>>();
+        foreach (var row in cafe.Coffees.Values)
+        {
+            int old = player.GetTask(CoffeeTaskGroup, row.Id);
+            int bits = old;
+            if (!string.IsNullOrWhiteSpace(row.Cond1))
+                bits = CoffeeStagePassed(player, row.Cond1) ? bits | 1 : bits & ~1;
+            if (row.RequiredPlayerLevel > 0)
+                bits = player.Level >= row.RequiredPlayerLevel ? bits | 4 : bits & ~4;
+            if (bits == old) continue;
+            player.SetTask(CoffeeTaskGroup, row.Id, bits);
+            changes.Add(new(Player.ComposeTaskId(CoffeeTaskGroup, row.Id), bits));
+        }
+        return changes;
+    }
+
+    internal static bool CoffeeStagePassed(Player player, string condition)
+    {
+        var parts = condition.Trim().Trim('[', ']').Split('-');
+        if (parts.Length != 3 || !int.TryParse(parts[0], out int chapter) ||
+            !int.TryParse(parts[1], out int index) || !int.TryParse(parts[2], out int diff) ||
+            chapter <= 0 || index <= 0 || diff <= 0) return false;
+        return MapList.PassCount(player.GetLevelStar(MapList.MapId(chapter, index, diff))) > 0;
+    }
+
+    internal static void LimitDailyEarn(int[] baseEarn, int[] extraEarn, int slot, int used, int limit)
+    {
+        long remaining = Math.Max(0L, (long)limit - used);
+        baseEarn[slot] = (int)Math.Min(Math.Max(0, baseEarn[slot]), remaining);
+        remaining -= baseEarn[slot];
+        extraEarn[slot] = (int)Math.Min(Math.Max(0, extraEarn[slot]), remaining);
+    }
+
+    private void SettleElapsedSeats(ClientSession session, Player player)
+    {
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var state = CafeFeature.ReadState(player, _cafe);
+        var content = CafeFeature.ReadContent(player, state, _cafe,
+            CafeFeature.CafeDayIndex(DateTimeOffset.UtcNow), session.Id);
+        foreach (var seat in content.Seats)
+        {
+            if (seat.CustomerIdx is not int idx || seat.StartTime <= 0 || seat.StartTime > now ||
+                !_cafe.Coffees.TryGetValue(seat.CoffeeType, out var coffee) || coffee.Time <= 0 ||
+                now - seat.StartTime < coffee.Time) continue;
+            SettleDrink(session, DrinkOffCoffeeCmd, new JsonObject { ["customeridx"] = idx }, false);
+        }
     }
 
     // ================= 115 生成排队顾客 =================
@@ -286,17 +345,16 @@ public sealed class CafeBizFeature : IGameFeature
         var queue = content.Queue.ToList();
         long now = utcNow.ToUnixTimeSeconds();
 
-        var picked = PickGuest(state.Level);
+        var picked = PickGuest(player, state.Level, content.Weights);
         if (picked is null)
         {
-            // 表里一个可用顾客都没有（理论上不会发生）：回一个只带 basetime 的包，
-            // 客户端会走 `ClearGuestQueue` + 空队列，不会抛。
+            // 无符合解锁与权重条件的顾客时，保留现有队列。
             Reply(session, cmd, new JsonObject
             {
                 ["basetime"] = now,
-                ["customerqueue"] = new JsonArray(),
+                ["customerqueue"] = BuildQueue(queue),
             });
-            Log.Warn($"[session {session.Id}] Cafe_GenCustomer：等级 {state.Level} 下没有可用顾客模板，回空队列");
+            Log.Warn($"[session {session.Id}] Cafe_GenCustomer：等级 {state.Level} 下没有可用顾客模板，保留当前队列");
             return Task.CompletedTask;
         }
 
@@ -309,12 +367,17 @@ public sealed class CafeBizFeature : IGameFeature
         }
         else
         {
-            int idx = NextCustomerIdx(content, queue);
+            long previous = player.Extra.TryGetValue("cafeCustomerSequence", out var sequence) &&
+                sequence is JsonValue seq && seq.TryGetValue<int>(out var savedSequence) ? savedSequence : 0;
+            long nextIndex = Math.Max(previous + 1, NextCustomerIdx(content, queue));
+            if (nextIndex >= int.MaxValue) return Task.CompletedTask;
+            int idx = (int)nextIndex;
+            player.Extra["cafeCustomerSequence"] = idx;
             queue.Add(new CafeFeature.CafeQueueGuest(picked.Id, idx, now));
         }
 
         var next = CloneWith(content, queue: queue);
-        CafeFeature.WriteState(player, state, next);
+        WriteMoodState(session, player, state, next);
         _ctx.Store.Save(player);
 
         Reply(session, cmd, new JsonObject
@@ -329,27 +392,26 @@ public sealed class CafeBizFeature : IGameFeature
         return Task.CompletedTask;
     }
 
-    /// <summary>按 <c>Weight</c> 加权抽一类顾客，过滤 <c>NeedLv</c> 超过当前等级的。</summary>
-    internal CafeGuestRow? PickGuest(int cafeLevel)
+    internal CafeGuestRow? PickGuest(Player player, int level,
+        IReadOnlyList<CafeFeature.CafeGuestWeight> weights)
     {
-        var pool = _cafe.Guests.Values.Where(g => g.NeedLv <= cafeLevel).ToList();
-        if (pool.Count == 0)
-            return null;
-
-        // WeightMax 作为权重（表头「人气上限」，RollDailyGuests 也用它）；全 0 时退化为等概率
-        int total = pool.Sum(g => Math.Max(0, g.WeightMax));
-        if (total <= 0)
-            return pool[Random.Shared.Next(pool.Count)];
-
-        int roll = Random.Shared.Next(total);
-        foreach (var g in pool)
+        var pool = EligibleGuestWeights(_cafe, player, level, weights);
+        long total = pool.Sum(w => (long)w.Weight);
+        if (total <= 0) return null;
+        long roll = Random.Shared.NextInt64(total);
+        foreach (var entry in pool)
         {
-            roll -= Math.Max(0, g.WeightMax);
-            if (roll < 0)
-                return g;
+            roll -= entry.Weight;
+            if (roll < 0) return _cafe.Guests[entry.Id];
         }
-        return pool[^1];
+        return null;
     }
+
+    internal static List<CafeFeature.CafeGuestWeight> EligibleGuestWeights(CafeTable cafe,
+        Player player, int level, IReadOnlyList<CafeFeature.CafeGuestWeight> weights)
+        => weights.Where(w => w.Weight > 0 && cafe.Guests.TryGetValue(w.Id, out var g) &&
+            CafeFeature.IsGuestUnlocked(g, player, level))
+            .GroupBy(w => w.Id).Select(g => g.First()).ToList();
 
     /// <summary>
     /// 分配一个不与「已在座位上」和「已在队列里」重复的 <c>customeridx</c>。
@@ -366,7 +428,20 @@ public sealed class CafeBizFeature : IGameFeature
         foreach (var q in queue)
             if (q.CustomerIdx > max)
                 max = q.CustomerIdx;
-        return max + 1;
+        return max == int.MaxValue ? int.MaxValue : max + 1;
+    }
+
+    // Settle the old guest/assignment state before mutating it, then establish the
+    // new mode's clock. Guest arrival/departure cannot retroactively charge time.
+    private void WriteMoodState(ClientSession session, Player player, CafeFeature.CafeState state,
+        CafeFeature.CafeContent? content = null, bool notify = true)
+    {
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        _ctx.PledgeTimes.Refresh(player, now);
+        _mood.Refresh(session, player, now, notify);
+        CafeFeature.WriteState(player, state, content);
+        _mood.Refresh(session, player, now, notify);
+        _ctx.PledgeTimes.Refresh(player, now);
     }
 
     // ================= 114 座位上报 =================
@@ -422,7 +497,7 @@ public sealed class CafeBizFeature : IGameFeature
         }
 
         var next = CloneWith(content, seats: seats);
-        CafeFeature.WriteState(player, state, next);
+        WriteMoodState(session, player, state, next);
         _ctx.Store.Save(player);
 
         int occupied = seats.Count(s => s.CustomerIdx is not null);
@@ -441,8 +516,36 @@ public sealed class CafeBizFeature : IGameFeature
     /// </summary>
     private Task OnSetWaiterList(ClientSession session, int cmd, JsonNode? param)
     {
+        if (session.Tag is not Player player) return Task.CompletedTask;
+        lock (player)
+        {
+            void ReplyCurrent()
+            {
+                var state = CafeFeature.ReadState(player, _cafe);
+                var content = CafeFeature.ReadContent(player, state, _cafe, CafeFeature.CafeDayIndex(DateTimeOffset.UtcNow));
+                _ctx.LuaCalls.CallClient(session, cmd, CafeFeature.BuildRoomGirlsList(content.AreaGirls));
+            }
+            try { _ctx.PledgeTimes.SaveRefresh(_ctx.Store, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds()); }
+            catch (Exception) { ReplyCurrent(); return Task.CompletedTask; }
+            var before = new ChallengeMutationSnapshot(player);
+            try { return SetWaiterListLocked(session, cmd, param); }
+            catch (Exception error)
+            {
+                before.Restore(player);
+                Log.Warn($"[cafe] 排班保存失败，排班、计时和心情已回滚：{error.Message}");
+                ReplyCurrent();
+                return Task.CompletedTask;
+            }
+        }
+    }
+
+    private Task SetWaiterListLocked(ClientSession session, int cmd, JsonNode? param)
+    {
         if (session.Tag is not Player player)
             return Task.CompletedTask;
+
+        var oldMood = player.Girls.ToDictionary(g => g.Girlid, g => g.Moodvalue);
+        var oldClocks = player.Tasks.Where(p => p.Key >> 16 == 41).ToDictionary(p => p.Key, p => p.Value);
 
         var state = CafeFeature.ReadState(player, _cafe);
         var utcNow = DateTimeOffset.UtcNow;
@@ -483,9 +586,15 @@ public sealed class CafeBizFeature : IGameFeature
             areas.Add(list);
         }
 
+        areas = CafeFeature.ReadAreaGirls(CafeFeature.BuildRoomGirlsList(areas), player,
+            _cafe.LevelRowFor(state.Level), session.Id);
         var next = CloneWith(content, areaGirls: areas);
-        CafeFeature.WriteState(player, state, next);
-        _ctx.Store.Save(player);
+        WriteMoodState(session, player, state, next, notify: false);
+        _ctx.Store.SaveRequired(player);
+        foreach (var girl in player.Girls)
+            if (oldMood.GetValueOrDefault(girl.Girlid) != girl.Moodvalue) GameNotify.PushGirl(session, girl);
+        GameNotify.PushTaskValues(session, player.Tasks.Where(p => p.Key >> 16 == 41
+            && oldClocks.GetValueOrDefault(p.Key) != p.Value));
 
         // ★ 回包必须是三项的数组的数组，内层每个少女是 [girlId, modelId]
         var reply = new JsonArray();
@@ -523,7 +632,9 @@ public sealed class CafeBizFeature : IGameFeature
         // 同上：只在 JsonObject 上取字段
         var body = param as JsonObject;
         int type = ReadInt(body?["coffeetype"]);
-        int count = Math.Max(1, ReadInt(body?["count"], 1));
+        if (body?["count"] is not JsonValue countNode ||
+            !countNode.TryGetValue<int>(out int count) || count <= 0)
+            return Fail(session, cmd, 20062);
 
         if (!_cafe.Coffees.ContainsKey(type))
         {
@@ -534,23 +645,37 @@ public sealed class CafeBizFeature : IGameFeature
             return Task.CompletedTask;
         }
 
+        // Only bit 8 means learned; condition flags in bits 0..2 do not permit production.
+        if ((player.GetTask(CoffeeTaskGroup, type) & (1 << CoffeeLearnedBit)) == 0)
+            return Fail(session, cmd, ErrCoffeePrevNotLearned);
+
+        int maxKinds = Math.Clamp(_cafe.LevelRowFor(state.Level)?.SlotCoffee ?? 1, 0, MaxCoffeeKinds);
         var coffees = content.Coffees.ToList();
         int at = coffees.FindIndex(c => c.CoffeeType == type);
+        long existing = at >= 0 ? coffees[at].Count : 0;
+        int maxCups = _cafe.LevelRowFor(state.Level)?.MaxCoffee ?? 0;
+        if (maxCups <= 0 || existing + count > maxCups)
+            return Fail(session, cmd, 20062);
+        long cost = (long)_cafe.Coffees[type].Cost * count;
+        if (existing + count > int.MaxValue || cost < 0 || cost > player.GetMoney(GoldMoneyId))
+            return Fail(session, cmd, 20012);
         if (at >= 0)
             coffees[at] = new CafeFeature.CafeCoffee(type, coffees[at].Count + count);
-        else if (coffees.Count < MaxCoffeeKinds)
+        else if (coffees.Count < maxKinds)
             coffees.Add(new CafeFeature.CafeCoffee(type, count));
         else
         {
             Log.Warn($"[session {session.Id}] Cafe_MakeCoffee 橱窗已有 {coffees.Count} 种" +
-                     $"（上限 {MaxCoffeeKinds}，再多会让客户端点橱窗时抛），拒绝新种类 {type}");
+                     $"（当前等级上限 {maxKinds}），拒绝新种类 {type}");
             Reply(session, cmd, new JsonObject { ["nError"] = 1 });
             return Task.CompletedTask;
         }
 
         var next = CloneWith(content, coffees: coffees);
-        CafeFeature.WriteState(player, state, next);
+        player.AddMoney(GoldMoneyId, -(int)cost);
+        WriteMoodState(session, player, state, next);
         _ctx.Store.Save(player);
+        GameNotify.PushMoney(session, player, GoldMoneyId);
 
         // ★ 成功：只发 coffeelist，不带 nError
         var list = new JsonArray();
@@ -593,6 +718,7 @@ public sealed class CafeBizFeature : IGameFeature
         var body = param as JsonObject;
         int type = ReadInt(body?["coffeetype"]);
 
+        int maxKinds = Math.Clamp(_cafe.LevelRowFor(state.Level)?.SlotCoffee ?? 1, 0, MaxCoffeeKinds);
         var coffees = content.Coffees.ToList();
         int at = coffees.FindIndex(c => c.CoffeeType == type);
         if (at < 0)
@@ -609,7 +735,7 @@ public sealed class CafeBizFeature : IGameFeature
         coffees.RemoveAt(at);
 
         var next = CloneWith(content, coffees: coffees);
-        CafeFeature.WriteState(player, state, next);
+        WriteMoodState(session, player, state, next);
         _ctx.Store.Save(player);
 
         // ★ 成功：回**清除之后**的完整橱窗，不带 nError
@@ -744,7 +870,13 @@ public sealed class CafeBizFeature : IGameFeature
         // ---- 通过：扣钱、写等级 ----
         if (row.NeedGold > 0)
             player.AddMoney(GoldMoneyId, -row.NeedGold);
-        CafeFeature.WriteState(player, state with { Level = next });
+        var inventory = HouseFeature.ReadOrCreate(player, _house, session.Id);
+        var upgraded = state with
+        {
+            Level = next,
+            Comfort = HouseComfort.Calculate(_house, inventory, next, _cafe.MaxComfort)
+        };
+        WriteMoodState(session, player, upgraded);
         _ctx.Store.Save(player);
 
         Log.Info($"[session {session.Id}] 咖啡馆升级 lv={cur} → {next}" +
@@ -754,8 +886,8 @@ public sealed class CafeBizFeature : IGameFeature
         // ★ 先推货币变更（pf 1029），再回业务包 —— 与商店/养成域同一条时序规矩
         GameNotify.PushMoney(session, player, GoldMoneyId);
 
-        // ★ 成功回包只带 level，绝不带 nError（真值判断）
-        Reply(session, cmd, new JsonObject { ["level"] = next });
+        // LuaCall.lua's level-up callback applies comfort, including zero.
+        Reply(session, cmd, new JsonObject { ["level"] = next, ["comfort"] = upgraded.Comfort });
         return Task.CompletedTask;
     }
 
@@ -809,6 +941,9 @@ public sealed class CafeBizFeature : IGameFeature
     /// 客户端那边 `AddCacheGold` 只是本地预显示，真值仍以服务端为准。
     /// </summary>
     private Task OnDrinkOffCoffee(ClientSession session, int cmd, JsonNode? param)
+        => SettleDrink(session, cmd, param, true);
+
+    private Task SettleDrink(ClientSession session, int cmd, JsonNode? param, bool reply)
     {
         if (session.Tag is not Player player)
         {
@@ -844,14 +979,46 @@ public sealed class CafeBizFeature : IGameFeature
 
         var (earnBase, earnEx, guestStar) = ComputeEarn(seat, player.Roleid, idx);
 
-        // ---- 实发收益 ----
-        if (earnBase[0] + earnEx[0] > 0)
-            player.AddMoney(GoldMoneyId, earnBase[0] + earnEx[0]);
-        if (earnBase[1] + earnEx[1] > 0)
-            player.AddMoney(CoffeeCoinMoneyId, earnBase[1] + earnEx[1]);
+        int settlementDay = CafeFeature.CafeDayIndex(DateTimeOffset.UtcNow);
+        var daily = player.Extra.TryGetValue("cafeDailyEarnings", out var dn) ? dn as JsonObject : null;
+        bool sameDay = ReadInt(daily?["day"], int.MinValue) == settlementDay;
+        int dailyGold = sameDay ? Math.Max(0, ReadInt(daily?["gold"])) : 0;
+        int dailyCoin = sameDay ? Math.Max(0, ReadInt(daily?["coin"])) : 0;
+        var limits = _cafe.LevelRowFor(state.Level);
+        LimitDailyEarn(earnBase, earnEx, 0, dailyGold, limits?.DailyLmtGold ?? 0);
+        LimitDailyEarn(earnBase, earnEx, 1, dailyCoin, limits?.DailyLmtCoffeeCoin ?? 0);
 
-        int hotGain = earnBase[2] + earnEx[2];
-        int newHot = state.Hot + hotGain;
+        LimitDailyEarn(earnBase, earnEx, 1,
+            Math.Max(0, player.GetMoney(CoffeeCoinMoneyId)), limits?.CoffeeCoinMax ?? 0);
+        var reportBefore = ReadReport(player);
+        long[] reportTotals = {
+            (long)reportBefore.BaseGold + earnBase[0], (long)reportBefore.BaseCoin + earnBase[1],
+            (long)reportBefore.BaseHot + earnBase[2], (long)reportBefore.ExGold + earnEx[0],
+            (long)reportBefore.ExCoin + earnEx[1], (long)reportBefore.ExHot + earnEx[2]
+        };
+        if (reportTotals.Any(v => v < 0 || v > int.MaxValue) ||
+            reportBefore.OutList.GetValueOrDefault(seat.CoffeeType) == int.MaxValue)
+            return Task.CompletedTask;
+
+        // Validate the whole settlement before changing money, seats or report counters.
+        long goldGain = (long)earnBase[0] + earnEx[0];
+        long coinGain = (long)earnBase[1] + earnEx[1];
+        long hotGain = (long)earnBase[2] + earnEx[2];
+        if (goldGain < 0 || coinGain < 0 || hotGain < 0 ||
+            (long)player.GetMoney(GoldMoneyId) + goldGain > int.MaxValue ||
+            (long)player.GetMoney(CoffeeCoinMoneyId) + coinGain > int.MaxValue ||
+            (long)state.Hot + hotGain > int.MaxValue)
+            return Task.CompletedTask;
+
+        if (goldGain > 0) player.AddMoney(GoldMoneyId, (int)goldGain);
+        if (coinGain > 0) player.AddMoney(CoffeeCoinMoneyId, (int)coinGain);
+        int newHot = (int)(state.Hot + hotGain);
+
+        player.Extra["cafeDailyEarnings"] = new JsonObject
+        {
+            ["day"] = settlementDay, ["gold"] = (long)dailyGold + goldGain,
+            ["coin"] = (long)dailyCoin + coinGain
+        };
 
         // ---- 顾客离场：清空该座位、消耗那杯咖啡 ----
         var seats = content.Seats.ToList();
@@ -862,7 +1029,7 @@ public sealed class CafeBizFeature : IGameFeature
         // ★ 累加进营业报告（122 纯下行时用）
         AccumulateReport(player, seat.CoffeeType, earnBase, earnEx);
 
-        CafeFeature.WriteState(player, state with { Hot = newHot }, updated);
+        WriteMoodState(session, player, state with { Hot = newHot }, updated);
         _ctx.Store.Save(player);
 
         Log.Info($"[session {session.Id}] 顾客喝完结算 customeridx={idx}（{guestStar}★、座位 {seat.Position}、" +
@@ -873,7 +1040,7 @@ public sealed class CafeBizFeature : IGameFeature
         GameNotify.PushMoney(session, player, new[] { GoldMoneyId, CoffeeCoinMoneyId });
 
         // ★★ 三个字段缺一不可，且两个 earn 必须是三元素数组
-        Reply(session, cmd, new JsonObject
+        if (reply) Reply(session, cmd, new JsonObject
         {
             ["customeridx"] = idx,
             ["earn_base"] = new JsonArray { earnBase[0], earnBase[1], earnBase[2] },
@@ -950,7 +1117,7 @@ public sealed class CafeBizFeature : IGameFeature
         }
 
         int newHot = state.Hot - cfg.NeedHot;
-        CafeFeature.WriteState(player, state with { Hot = newHot });
+        WriteMoodState(session, player, state with { Hot = newHot });
 
         var granted = _ctx.Rewards.Grant(player, _cafe.MaxRewardAwards, RewardSource.Extra);
         _ctx.Store.Save(player);
@@ -1056,9 +1223,19 @@ public sealed class CafeBizFeature : IGameFeature
     /// </summary>
     private Task OnGetMaxExpReward(ClientSession session, int cmd, JsonNode? param)
     {
-        Log.Info($"[session {session.Id}] Cafe_GetMaxExpReward（139 少女好感度满级兑换）：" +
-                 "★ 兑换规则未取证（服务端侧 CafeLogic:OnCmdGirlMaxExpReward 不在包内）" +
-                 "⇒ 只回包刷新界面，不发奖");
+        if (session.Tag is not Player player) return Task.CompletedTask;
+        int id = ReadInt(param, 0);
+        var girl = id > 0 ? player.GetGirl((uint)id) : null;
+        var love = GirlLoveTable.Load(Path.GetFullPath(_ctx.Options.SettingDirectory));
+        if (girl is null || love.MaxLevel((uint)id) <= 1 ||
+            girl.Level < love.MaxLevel((uint)id) || girl.Exp < 3000)
+            return Task.CompletedTask;
+        int count = (int)(girl.Exp / 3000);
+        var reward = _ctx.Rewards.Grant(player, new[] { new[] { 8, 2, 3, 1, count } }, RewardSource.Extra);
+        girl.Exp %= 3000;
+        _ctx.Store.Save(player);
+        GameNotify.PushGirl(session, girl);
+        GameNotify.PushRewards(session, player, reward);
         Reply(session, cmd, new JsonObject());
         return Task.CompletedTask;
     }
@@ -1090,8 +1267,8 @@ public sealed class CafeBizFeature : IGameFeature
     /// Time/Cost/Price/Max/AwardA/RateA/AwardB/RateB/AwardC/RateC/Cond1/Cond2/Cond3/UnlockCostItem</c>）
     /// ⇒ 客户端读它们时走 <c>tonumber(tbRow["X"] or 0)</c> 兜底 ⇒ **恒为 0 ⇒ 四项检查恒通过**。
     /// ⇒ 服务端也就**没有技能点/等级/金币可校验**，只保留「前置咖啡」这一条
-    /// （来自实际存在的 <c>Cond1</c> 列，格式 <c>[前置咖啡id-?-?]</c>，
-    /// 现网只有咖啡 6/8/10/12 配了：分别要求 4/5/6/8 号已学）。
+    /// （来自实际存在的 <c>Cond1</c> 列，格式 <c>[关卡章节-关卡-难度]</c>，
+    /// Cond1 为关卡条件，不能解释为咖啡依赖）。
     /// ★ <c>UnlockCostItem</c>（= <c>Cond4</c>，道具消耗）现网**全空** ⇒ 无需扣道具。
     ///
     /// <para><b>回包（A 族）</b></para>
@@ -1129,7 +1306,19 @@ public sealed class CafeBizFeature : IGameFeature
             return Fail(session, cmd, ErrCoffeeAlreadyLearned);
         }
 
-        // ★ 前置咖啡（Cond1 的第 1 段）—— 现网唯一可校验的条件
+        var conditionChanges = RefreshCoffeeConditions(player);
+        if (conditionChanges.Count > 0)
+        {
+            _ctx.Store.Save(player);
+            GameNotify.PushTaskValues(session, conditionChanges);
+        }
+        bits = player.GetTask(CoffeeTaskGroup, id);
+        var recipe = _cafe.Coffees[id];
+        if ((!string.IsNullOrWhiteSpace(recipe.Cond1) && (bits & 1) == 0) ||
+            (recipe.RequiredPlayerLevel > 0 && (bits & 4) == 0))
+            return Fail(session, cmd, ErrCoffeePrevNotLearned);
+
+        // 前置咖啡仅对应 PrevCoffee；当前配置未提供该列。
         int prev = _cafe.CoffeePrereq(id);
         if (prev > 0 && (player.GetTask(CoffeeTaskGroup, prev) & (1 << CoffeeLearnedBit)) == 0)
         {
@@ -1230,6 +1419,8 @@ public sealed class CafeBizFeature : IGameFeature
             return Task.CompletedTask;
         }
 
+        if (_mood.Leave(session, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
+            _ctx.Store.Save(player);
         int useTime = ReadInt((param as JsonObject)?["usetime"]);
         Log.Info($"[session {session.Id}] 玩家离开咖啡馆（停留 {useTime} 秒）");
 
@@ -1550,7 +1741,7 @@ public sealed class CafeBizFeature : IGameFeature
             coffees[0] = pick with { Count = pick.Count - 1 };
 
         var updated = CloneWith(content, seats: seats, queue: queue, coffees: coffees);
-        CafeFeature.WriteState(player, state, updated);
+        WriteMoodState(session, player, state, updated);
         _ctx.Store.Save(player);
 
         Log.Info($"[session {session.Id}] 顾客入座 customeridx={guest.CustomerIdx}" +

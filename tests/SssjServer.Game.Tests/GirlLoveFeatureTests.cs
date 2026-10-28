@@ -21,6 +21,153 @@ namespace SssjServer.Game.Tests;
 /// </summary>
 public class GirlLoveFeatureTests
 {
+    [Theory]
+    [InlineData(0, 1)]
+    [InlineData(2, 2)]
+    public async Task ChapterCompletionImmediatelyUnlocksEligibleSubStory(int old, int expected)
+    {
+        using var h = await FeatureHarness.CreateAsync("girl-sub-stage-live");
+        h.Player.GetGirl(1)!.Level = 15;
+        int task = GirlLoveFeature.VarTaskId(1, GirlLoveFeature.ELevelOffset(11));
+        h.Player.SetTask(3, task, old);
+        await h.DispatchFunctionAsync("ChapterMsg", new JsonObject { ["nState"] = 0, ["Chapter"] = 2, ["Index"] = 6, ["Difficult"] = 1 }.ToJsonString());
+        await h.CompleteChapterAsync(2, 6, 1);
+        Assert.Equal(expected, h.Player.GetTask(3, task));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(expected, saved.GetTask(3, task));
+        Assert.True(await h.WaitForPfAsync(GamePf.TaskValueSyncRsp));
+    }
+
+    [Theory]
+    [InlineData(0, 1)]
+    [InlineData(2, 2)]
+    public async Task GirlMissionRewardCrossesLevelTenAndSynchronizesStory(int prior, int expected)
+    {
+        using var h = await FeatureHarness.CreateAsync("mission-love-threshold");
+        var table = GirlLoveTable.Load(TestPaths.SettingDir);
+        var girl = Seed(h, level: 9, exp: (uint)(table.LevelUpExp(1, 9) - 1));
+        SeedGirlEvent(h);
+        int task = GirlLoveFeature.VarTaskId(1, GirlLoveFeature.ELevelOffset(5));
+        h.Player.SetTask(3, task, prior);
+        await h.DispatchLuaCallAsync(GirlLoveFeature.CmdGirlMissionReward, $"{{\"nId\":{GirlEventId}}}");
+        Assert.True(girl.Level >= 10);
+        Assert.Equal(expected, h.Player.GetTask(3, task));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(expected, saved.GetTask(3, task));
+        Assert.Equal(girl.Level, saved.GetGirl(1)!.Level);
+        Assert.True(await h.WaitForPfAsync(GamePf.TaskValueSyncRsp));
+    }
+
+    [Theory]
+    [InlineData(60, true, false, 75)]
+    [InlineData(60, true, true, 120)]
+    [InlineData(60, false, false, 60)]
+    [InlineData(60, false, true, 60)]
+    [InlineData(3, true, false, 3)]
+    [InlineData(2147483647, true, true, 4294967294L)]
+    public void FavoriteGiftExperienceRoundsEachItemAndUsesWideArithmetic(int exp, bool favorite, bool link, long expected)
+        => Assert.Equal(expected, GirlLoveFeature.GiftExperiencePerItem(exp, favorite, link));
+
+    [Theory]
+    [InlineData(false, 10)]
+    [InlineData(true, 1)]
+    [InlineData(true, 11)]
+    public async Task InvalidLinkStoryDoesNotGrantOrWriteReadBit(bool owns, int requestedLevel)
+    {
+        using var h = await FeatureHarness.CreateAsync("invalid-link-story");
+        if (owns) Seed(h, girlId: 201, level: 1);
+        int before = h.Player.GetMoney(2);
+        await h.DispatchFunctionAsync("GirlLogic",
+            $"{{\"sCmd\":\"ViewLinkStory\",\"nId\":201,\"Level\":{requestedLevel}}}");
+        Assert.NotNull(Reply(h)["nError"]);
+        Assert.Equal(before, h.Player.GetMoney(2));
+        Assert.Equal(0, GirlLoveFeature.GetVar(h.Player, 201, GirlLoveFeature.VarMainStoryId));
+    }
+
+    [Theory]
+    [InlineData(9, 0)]
+    [InlineData(10, 1)]
+    [InlineData(100, 1)]
+    public async Task SecretUnlockUsesAffectionThresholdAndKeepsGiftSecretsLocked(int level, int expected)
+    {
+        using var h = await FeatureHarness.CreateAsync("girl-secret-threshold");
+        var girl = Seed(h, level: (uint)level);
+        var table = GirlLoveTable.Load(TestPaths.SettingDir);
+        h.Player.SetTask(3, 107, 0); // Secret8: level10
+        h.Player.SetTask(3, 110, 0); // Secret11: matching gift
+        h.Player.SetTask(3, 108, 2); // already read Secret9
+        GirlLoveFeature.UnlockSecrets(table, h.Player, 1);
+        Assert.Equal(expected, h.Player.GetTask(3, 107));
+        Assert.Equal(0, h.Player.GetTask(3, 110));
+        Assert.Equal(2, h.Player.GetTask(3, 108));
+        GirlLoveFeature.UnlockSecrets(table, h.Player, 1, [5, 1, 1, 2]);
+        Assert.Equal(1, h.Player.GetTask(3, 110));
+    }
+
+    [Fact]
+    public async Task MaxAffectionGiftAccumulatesAndRedeemsWithRemainder()
+    {
+        using var h = await FeatureHarness.CreateAsync("gift-overflow-redeem");
+        var girl = Seed(h, level: 100, exp: 2990);
+        await GiftAsync(h, 1);
+        Assert.Equal(3065u, girl.Exp);
+        long Count() => h.Player.Items.Where(x => x.Genre == 8 && x.Detail == 2 && x.Particular == 3 && x.Level == 1).Sum(x => (long)x.Count);
+        long before = Count();
+        await h.DispatchLuaCallAsync(139, "1");
+        Assert.Equal(65u, girl.Exp);
+        Assert.Equal(before + 1, Count());
+        await h.DispatchLuaCallAsync(139, "1");
+        Assert.Equal(before + 1, Count());
+        Assert.Equal(65u, new PlayerStore(h.Options).Load(h.Player.Account)!.GetGirl(1)!.Exp);
+    }
+
+    [Fact]
+    public async Task LinkStoryAwardsOnceAndStoresGroup90Bit()
+    {
+        using var h = await FeatureHarness.CreateAsync("link-story-reward");
+        Seed(h, girlId: 201, level: 10);
+        int before = h.Player.GetMoney(2);
+        const string payload = "{\"sCmd\":\"ViewLinkStory\",\"nId\":201,\"Level\":10}";
+        await h.DispatchFunctionAsync("GirlLogic", payload);
+        Assert.Equal(before + 10000, h.Player.GetMoney(2));
+        int task = GirlLoveFeature.VarTaskId(201, GirlLoveFeature.VarMainStoryId);
+        Assert.Equal(2, h.Player.GetTask(90, task));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(2, saved.GetTask(90, task));
+        await h.DispatchLuaCallAsync(256, "{\"nId\":201,\"nValue\":0}");
+        Assert.Equal(2, h.Player.GetTask(90, task));
+        await h.DispatchFunctionAsync("GirlLogic", payload);
+        Assert.Equal(before + 10000, h.Player.GetMoney(2));
+        Assert.NotNull(Reply(h)["nError"]);
+    }
+
+    [Fact]
+    public void SubStoryConditionRequiresExactStagePassAndRejectsUnavailable()
+    {
+        var p = new Player("sub-condition", 1);
+        var story = new GirlLoveTable.StoryAward(1, 15, new(), false, [1, 2, 6, 1]);
+        Assert.False(GirlLoveFeature.StoryConditionMet(p, story));
+        p.RecordLevelPass(MapList.MapId(2, 6, 2), 7);
+        Assert.False(GirlLoveFeature.StoryConditionMet(p, story));
+        p.RecordLevelPass(MapList.MapId(2, 6, 1), 7);
+        Assert.True(GirlLoveFeature.StoryConditionMet(p, story));
+        Assert.False(GirlLoveFeature.StoryConditionMet(p, story with { Condition = [-1] }));
+        Assert.False(GirlLoveFeature.StoryConditionMet(p, story with { Condition = [999] }));
+    }
+
+    [Fact]
+    public async Task MainStoryProgressRejectsSkippingFirstStory()
+    {
+        using var h = await FeatureHarness.CreateAsync("main-skip");
+        h.Player.GetGirl(1)!.Level = 100;
+        await h.DispatchLuaCallAsync(256, "{\"nId\":1,\"nValue\":2}");
+        Assert.Equal(0, GirlLoveFeature.GetVar(h.Player, 1, GirlLoveFeature.VarMainStoryId));
+        await h.DispatchLuaCallAsync(256, "{\"nId\":1,\"nValue\":1}");
+        Assert.Equal(1, GirlLoveFeature.GetVar(h.Player, 1, GirlLoveFeature.VarMainStoryId));
+        await h.DispatchLuaCallAsync(256, "{\"nId\":1,\"nValue\":2}");
+        Assert.Equal(2, GirlLoveFeature.GetVar(h.Player, 1, GirlLoveFeature.VarMainStoryId));
+    }
+
     /// <summary>礼物道具：<c>5-1-1-2</c>（少女 1 的低阶喜爱礼物，<c>ExtParam1</c> = 60）。</summary>
     private const int GiftG = 5, GiftD = 1, GiftP = 1, GiftL = 2;
 
@@ -86,6 +233,69 @@ public class GirlLoveFeatureTests
     // ================= GirlGift 送礼 =================
 
     [Fact]
+    public async Task GiftShortageRejectsWholeBatch()
+    {
+        using var h = await FeatureHarness.CreateAsync("gift-short-batch");
+        var girl = Seed(h, giftCount: 2);
+        await GiftAsync(h, 1, num: 3);
+        Assert.NotNull(Reply(h)["nError"]);
+        Assert.Equal(2u, h.Player.Items.Single(i => i.Genre == GiftG).Count);
+        Assert.Equal(0u, girl.Exp);
+        Assert.Equal(1u, girl.Level);
+    }
+
+    [Theory]
+    [InlineData("0", "[5,1,1,2]")]
+    [InlineData("-1", "[5,1,1,2]")]
+    [InlineData("null", "[5,1,1,2]")]
+    [InlineData("1.5", "[5,1,1,2]")]
+    [InlineData("1", "[5,1,1,2,9]")]
+    public async Task InvalidGiftBatchDoesNotConsume(string count, string tuple)
+    {
+        using var h = await FeatureHarness.CreateAsync("gift-invalid-batch");
+        var girl = Seed(h);
+        await h.DispatchFunctionAsync(GirlLoveFeature.Function,
+            "{\"sCmd\":\"GirlGift\",\"nId\":1,\"ItemNum\":" + count + ",\"tbItem\":" + tuple + "}");
+        Assert.NotNull(Reply(h)["nError"]);
+        Assert.Equal(10u, h.Player.Items.Single(i => i.Genre == GiftG).Count);
+        Assert.Equal(0u, girl.Exp);
+    }
+
+    [Fact]
+    public async Task GiftLevelUpImmediatelyUnlocksStoryAndPersists()
+    {
+        using var h = await FeatureHarness.CreateAsync("gift-unlock-now");
+        var table = GirlLoveTable.Load(TestPaths.SettingDir);
+        Seed(h, level: 4, exp: (uint)(table.LevelUpExp(1, 4) - 1));
+        int off = GirlLoveFeature.ELevelOffset(2); // first side story, level 5
+        h.Player.SetTask(3, GirlLoveFeature.VarTaskId(1, off), 0);
+        h.Player.SetTask(3, GirlLoveFeature.VarTaskId(1, GirlLoveFeature.ELevelOffset(1)), 2);
+        await GiftAsync(h, 1);
+        Assert.True(h.Player.GetGirl(1)!.Level >= 5);
+        Assert.Equal(1, GirlLoveFeature.GetVar(h.Player, 1, off));
+        Assert.Equal(2, GirlLoveFeature.GetVar(h.Player, 1, GirlLoveFeature.ELevelOffset(1)));
+        Assert.True(await h.WaitForPfAsync(GamePf.TaskValueSyncRsp));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(1, GirlLoveFeature.GetVar(saved, 1, off));
+        Assert.Equal(9u, saved.Items.Single(i => i.Genre == GiftG).Count);
+    }
+
+    [Theory]
+    [InlineData(5)] // level 10 required
+    [InlineData(9999)]
+    public async Task LockedOrUnknownStoryCannotGrantRewards(int story)
+    {
+        using var h = await FeatureHarness.CreateAsync("gift-story-locked");
+        Seed(h);
+        int before = h.Player.GetMoney(1);
+        await h.DispatchFunctionAsync(GirlLoveFeature.Function,
+            $"{{\"sCmd\":\"ViewStory\",\"nId\":1,\"nType\":1,\"nStoryId\":{story}}}");
+        Assert.NotNull(Reply(h)["nError"]);
+        Assert.Equal(before, h.Player.GetMoney(1));
+        Assert.Equal(0, GirlLoveFeature.GetVar(h.Player, 1, GirlLoveFeature.ELevelOffset(story)));
+    }
+
+    [Fact]
     public async Task 送礼_扣道具并加好感经验()
     {
         using var h = await FeatureHarness.CreateAsync("gift-basic");
@@ -93,10 +303,10 @@ public class GirlLoveFeatureTests
 
         await GiftAsync(h, 1, num: 2);
 
-        // ExtParam1 = 60（5-1-1-2），送 2 个 ⇒ 120 经验；1 级升级需 100
+        // ExtParam1 = 60（5-1-1-2），送 2 个喜爱礼物 ⇒ 150 经验；1 级升级需 100
         // ⇒ 升到 2 级、余 20 经验
         Assert.Equal(2u, girl.Level);
-        Assert.Equal(20u, girl.Exp);
+        Assert.Equal(50u, girl.Exp);
         // 道具从 10 扣到 8
         Assert.Equal(8u, h.Player.Items.Single(i => i.Genre == GiftG).Count);
     }
@@ -118,9 +328,9 @@ public class GirlLoveFeatureTests
         Assert.True(r["bLove"]!.GetValue<bool>(), "5-1-1-2 是少女 1 的喜爱礼物，bLove 应为 true");
         Assert.False(r["bAct"]!.GetValue<bool>());
         Assert.False(r["bSp"]!.GetValue<bool>());
-        Assert.Equal(60, r["nAddExp"]!.GetValue<int>());
+        Assert.Equal(75, r["nAddExp"]!.GetValue<int>());
         Assert.Equal(0, r["nOldExp"]!.GetValue<int>());
-        Assert.Equal(60, r["nNewExp"]!.GetValue<int>());
+        Assert.Equal(75, r["nNewExp"]!.GetValue<int>());
         Assert.Equal(1, r["nOldLevel"]!.GetValue<int>());
         Assert.Equal(1, r["nNewLevel"]!.GetValue<int>());
         // 没满级 ⇒ 不带 nIsMaxlevel（真值判断）
@@ -139,7 +349,7 @@ public class GirlLoveFeatureTests
     }
 
     [Fact]
-    public async Task 送礼_满级回错误码4()
+    public async Task 送礼_满级累计溢出好感()
     {
         using var h = await FeatureHarness.CreateAsync("gift-max");
         // 少女 1 上限 100
@@ -149,13 +359,13 @@ public class GirlLoveFeatureTests
 
         var r = Reply(h);
         // ★ 客户端 OnGirlGiftError 只认 nCode == 4（弹 Girl.MaxLevel），其余码静默
-        Assert.Equal(GirlLoveFeature.ErrGiftMaxLevel, r["nError"]!.GetValue<int>());
+        Assert.Null(r["nError"]);
         // 满级不该扣道具
-        Assert.Equal(10u, h.Player.Items.Single(i => i.Genre == GiftG).Count);
+        Assert.Equal(9u, h.Player.Items.Single(i => i.Genre == GiftG).Count);
     }
 
     [Fact]
-    public async Task 送礼_满级少女拒绝并回错误码4()
+    public async Task 送礼_其他满级少女同样可送礼()
     {
         using var h = await FeatureHarness.CreateAsync("gift-ban");
         // ★★ 第十轮：新版 `setting.u` 把 `Friendliness.BanGirl` **整列清空**
@@ -165,7 +375,7 @@ public class GirlLoveFeatureTests
 
         await GiftAsync(h, 13);
 
-        Assert.Equal(GirlLoveFeature.ErrGiftMaxLevel, Reply(h)["nError"]!.GetValue<int>());
+        Assert.Null(Reply(h)["nError"]);
     }
 
     [Fact]
@@ -231,9 +441,9 @@ public class GirlLoveFeatureTests
 
         var r = Reply(h);
         // ★ 撞上限时 nAddExp 被截断成「真正吃下去的那部分」（照 GirlCommon:Add 的 nValue -= nTotalExp）
-        Assert.Equal(1, r["nAddExp"]!.GetValue<int>());
+        Assert.Equal(60, r["nAddExp"]!.GetValue<int>());
         Assert.Equal(max, r["nNewLevel"]!.GetValue<int>());
-        Assert.Equal(0, r["nNewExp"]!.GetValue<int>());
+        Assert.Equal(59, r["nNewExp"]!.GetValue<int>());
         // ★ 满级了 ⇒ 必须带 nIsMaxlevel（客户端据此弹「已满级」）
         Assert.True(r["nIsMaxlevel"]!.GetValue<bool>());
     }
@@ -327,7 +537,7 @@ public class GirlLoveFeatureTests
     public async Task 看联动剧情_原样回执()
     {
         using var h = await FeatureHarness.CreateAsync("story-link");
-        Seed(h, girlId: 201);
+        Seed(h, girlId: 201, level: 10);
 
         await h.DispatchFunctionAsync(GirlLoveFeature.Function,
             $"{{\"sCmd\":\"{GirlLoveFeature.CmdViewLinkStory}\",\"nId\":201,\"Level\":10}}");
@@ -504,45 +714,46 @@ public class GirlLoveFeatureTests
     }
 
     [Fact]
-    public async Task MainStoryId256_原样存整数且不回包()
+    public async Task MainStoryId256_顺序推进且不回包()
     {
         using var h = await FeatureHarness.CreateAsync("256-store");
         Seed(h);
 
         await h.DispatchLuaCallAsync(GirlLoveFeature.CmdGirlSetMainStoryId,
-                                     "{\"nId\":1,\"nValue\":7}");
+                                     "{\"nId\":1,\"nValue\":1}");
 
         // ★ 原样存（不解释语义：普通少女是顺序计数、联动少女是位域）
-        Assert.Equal(7, GirlLoveFeature.GetVar(h.Player, 1, GirlLoveFeature.VarMainStoryId));
+        Assert.Equal(1, GirlLoveFeature.GetVar(h.Player, 1, GirlLoveFeature.VarMainStoryId));
         // ★★ 原服 MODULE_SERVER 分支里连 CallClient 都没有 ⇒ 一定不回包
         Assert.Empty(h.Outbound);
     }
 
     [Fact]
-    public async Task MainStoryId256_不做递增校验()
+    public async Task MainStoryId256_允许回退播放进度()
     {
         using var h = await FeatureHarness.CreateAsync("256-nomono");
         Seed(h);
 
-        await h.DispatchLuaCallAsync(GirlLoveFeature.CmdGirlSetMainStoryId, "{\"nId\":1,\"nValue\":9}");
-        await h.DispatchLuaCallAsync(GirlLoveFeature.CmdGirlSetMainStoryId, "{\"nId\":1,\"nValue\":3}");
+        await h.DispatchLuaCallAsync(GirlLoveFeature.CmdGirlSetMainStoryId, "{\"nId\":1,\"nValue\":1}");
+        await h.DispatchLuaCallAsync(GirlLoveFeature.CmdGirlSetMainStoryId, "{\"nId\":1,\"nValue\":0}");
 
         // ★ 联动少女的位域值不保证单调 ⇒ 服务端不能加「只能递增」的校验（原服是无脑透传）
-        Assert.Equal(3, GirlLoveFeature.GetVar(h.Player, 1, GirlLoveFeature.VarMainStoryId));
+        Assert.Equal(0, GirlLoveFeature.GetVar(h.Player, 1, GirlLoveFeature.VarMainStoryId));
     }
 
     [Fact]
-    public async Task MainStoryId256_联动少女走group90且减200()
+    public async Task MainStoryId256_联动领奖位仅由服务器写入()
     {
         using var h = await FeatureHarness.CreateAsync("256-link");
         Seed(h, girlId: 201);
+        h.Player.SetTask(90, GirlLoveFeature.VarTaskId(201, GirlLoveFeature.VarMainStoryId), 2);
 
         await h.DispatchLuaCallAsync(GirlLoveFeature.CmdGirlSetMainStoryId,
                                      "{\"nId\":201,\"nValue\":5}");
 
         // ★ group 3→90、girlId 减 200 ⇒ 与普通少女 1 的坐标**不能**相撞
         Assert.Equal(90, GirlLoveFeature.VarGroup(201));
-        Assert.Equal(5, h.Player.GetTask(90, GirlLoveFeature.VarTaskId(201, GirlLoveFeature.VarMainStoryId)));
+        Assert.Equal(2, h.Player.GetTask(90, GirlLoveFeature.VarTaskId(201, GirlLoveFeature.VarMainStoryId)));
         // 普通少女 1 的同一偏移不受影响
         Assert.Equal(0, h.Player.GetTask(GmUnlock.GirlVarGroup,
                                          GirlLoveFeature.VarTaskId(1, GirlLoveFeature.VarMainStoryId)));
@@ -594,10 +805,11 @@ public class GirlLoveFeatureTests
     [Fact]
     public void ELevel偏移_越界返回负一()
     {
-        Assert.Equal(301, GirlLoveFeature.ELevelOffset(1));
-        Assert.Equal(399, GirlLoveFeature.ELevelOffset(99));
-        // 区段是 300..399 ⇒ index 100 越界
-        Assert.Equal(-1, GirlLoveFeature.ELevelOffset(100));
+        Assert.Equal(300, GirlLoveFeature.ELevelOffset(1));
+        Assert.Equal(398, GirlLoveFeature.ELevelOffset(99));
+        Assert.Equal(399, GirlLoveFeature.ELevelOffset(100));
+        // 区段是 300..399 ⇒ index 101 越界
+        Assert.Equal(-1, GirlLoveFeature.ELevelOffset(101));
         Assert.Equal(-1, GirlLoveFeature.ELevelOffset(0));
         Assert.Equal(-1, GirlLoveFeature.ELevelOffset(-3));
     }

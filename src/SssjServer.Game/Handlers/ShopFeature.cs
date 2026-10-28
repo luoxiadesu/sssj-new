@@ -173,6 +173,7 @@ public sealed class ShopFeature : IGameFeature
 
     private GameFeatureContext _ctx = null!;
     private ShopTable _table = ShopTable.Empty;
+    private CafeComfortSync _comfort = null!;
     private readonly Random _rng = new();
 
     public string Name => "商店（LuaCall 11/12/13/14）";
@@ -180,6 +181,7 @@ public sealed class ShopFeature : IGameFeature
     public void Install(GameFeatureContext ctx)
     {
         _ctx = ctx;
+        _comfort = new CafeComfortSync(ctx);
         // 自己加载配置表：不往 GameFeatureContext 加属性，避免多 agent 并行时改到公共文件
         _table = ShopTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
 
@@ -325,8 +327,10 @@ public sealed class ShopFeature : IGameFeature
             return Task.CompletedTask;
         }
 
+        bool comfortChanged = result.Granted.ChangedFurniture.Count > 0 && _comfort.Refresh(session, player);
         _ctx.Store.Save(player);
         PushBuyResult(session, player, result);
+        _comfort.Push(session, player, comfortChanged);
 
         // ★ 回包必须回显请求三要素（GoodsLogicC:OnReqBuyGoods）：
         //   goodsid —— :393 拿它查配置，查不到就静默跳过奖励弹窗；
@@ -416,8 +420,10 @@ public sealed class ShopFeature : IGameFeature
 
         if (ok > 0)
         {
+            bool comfortChanged = merged.Granted.ChangedFurniture.Count > 0 && _comfort.Refresh(session, player);
             _ctx.Store.Save(player);
             PushBuyResult(session, player, merged);
+            _comfort.Push(session, player, comfortChanged);
         }
 
         Reply(session, CmdReqBuyFurList, reply);
@@ -452,6 +458,7 @@ public sealed class ShopFeature : IGameFeature
                     ChangedMoney.Add(id);
             }
             _parts.AddRange(other._parts);
+            Granted.Absorb(other.Granted);
         }
 
         public string Describe()
@@ -536,6 +543,16 @@ public sealed class ShopFeature : IGameFeature
         int unit = goods.UnitPrice(priceIdx, entry.Discount);
         int total = unit * buyNum;
 
+        long grantCount = (long)goods.GoodsNum * buyNum;
+        if (grantCount <= 0 || grantCount > int.MaxValue
+            || !_ctx.Rewards.CanReceiveFurniture(player, (uint)goods.G, (uint)goods.D,
+                (uint)goods.P, (uint)goods.L, (int)grantCount))
+        {
+            Log.Warn($"[session {session.Id}] Furniture purchase exceeds ownership/storage capacity or has invalid configuration");
+            tipKey = TipBadGoodsId;
+            return null;
+        }
+
         var outcome = new BuyOutcome { BuyNum = buyNum, TotalPrice = total, MoneyId = goods.MoneyType };
         if (total > 0 && !TrySpendMoney(player, goods.MoneyType, total, outcome.ChangedMoney))
         {
@@ -593,6 +610,10 @@ public sealed class ShopFeature : IGameFeature
         var state = ShopStateOf(player, shopId);      // 只取一次：40001 有 499 件，别在循环里反复查
         var list = new JsonArray();
 
+        var furnitureCounts = shop?.IsCafeShop == true && _ctx.Rewards.Furniture is { } furnitureTable
+            ? HouseFeature.ReadOrCreate(player, furnitureTable).Furniture.GroupBy(f => f.TemplateId)
+                .ToDictionary(g => g.Key, g => g.Count()) : null;
+
         foreach (var e in shelf)
         {
             var goods = _table.GetGoods(e.GoodsId);
@@ -612,6 +633,11 @@ public sealed class ShopFeature : IGameFeature
                 ["totalbuynum"] = CountIn(state, ShopLimitKind.Total, e.GoodsId),
                 ["shelfbuynum"] = CountIn(state, ShopLimitKind.Shelf, e.GoodsId),
             };
+            if (furnitureCounts is not null
+                && _ctx.Rewards.IsCafeFurniture((uint)goods.G, (uint)goods.D, (uint)goods.P, (uint)goods.L)
+                && int.TryParse(_ctx.Rewards.Templates.Get((uint)goods.G, (uint)goods.D,
+                    (uint)goods.P, (uint)goods.L)?.ExtParam1, out int furnitureId))
+                item["totalbuynum"] = furnitureCounts.GetValueOrDefault(furnitureId);
             // pos = Group 号。只有社团商店 20006 会读它（GoodsLogicC.lua:227..241），
             // 但那里的默认值是「锁住」：pos 为 nil 时 bClublock 保持 true，整店只显示 1 件锁着的商品。
             if (e.Pos.HasValue)

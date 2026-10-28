@@ -16,6 +16,188 @@ public class CardFeatureTests
 {
     private const uint CardGenre = CardFeature.CardGenre;
 
+    [Fact]
+    public async Task FinalRefitUnlocksPermanentAlbumBitAndPreservesNeighborBits()
+    {
+        using var h = await FeatureHarness.CreateAsync("card-refit-album");
+        var (guid, row) = SeedRefitable(h, step: 4);
+        Assert.Equal(4, row.MaxRefit);
+        var card = h.Player.Items.Single(i => i.Guid == guid);
+        int id = (int)(card.Detail * 10000 + card.Particular * 10 + card.Level);
+        int task = id / 30, mask = 1 << (id % 30);
+        int neighbor = 1 << ((id % 30 + 1) % 30);
+        h.Player.SetTask(71, task, neighbor);
+        await RefitAsync(h, guid, 4);
+        Assert.Equal(neighbor | mask, h.Player.GetTask(71, task));
+        Assert.Equal(neighbor | mask, h.Module.Store.Load(h.Player.Account)!.GetTask(71, task));
+        h.Player.Items.Remove(card);
+        ((IGamePulseFeature)h.Module.Features.OfType<MissionFeature>().Single()).OnPlayerPulse(h.Session, h.Player);
+        Assert.Equal(neighbor | mask, h.Player.GetTask(71, task));
+    }
+
+    [Theory]
+    [InlineData(0, 1, false)]
+    [InlineData(3, 1, false)]
+    [InlineData(4, 0, false)]
+    [InlineData(4, 1, true)]
+    [InlineData(5, 1, false)]
+    public void AlbumMigrationOnlyMarksExistingExactlyMaxedCards(int refit, int count, bool expected)
+    {
+        var player = new Player("card-refit-marker", 1);
+        var card = new Item { Genre = 1, Detail = 2, Particular = 1, Level = 3,
+            RefitNum = (uint)refit, Count = (uint)count, LockOn = 1 };
+        var cards = CardTable.Load(TestPaths.SettingDir);
+        var templates = CharacterCardTable.Load(TestPaths.SettingDir);
+        Assert.Equal(expected, CardRefitCollection.Mark(player, card, cards, templates).HasValue);
+        Assert.Null(CardRefitCollection.Mark(player, card, cards, templates));
+    }
+
+    [Fact]
+    public async Task RefitReadsActualAffectionAndPreservesTrainedSkillsAfterReload()
+    {
+        using var h = await FeatureHarness.CreateAsync("card-refit-real-love");
+        var (guid, row) = SeedRefitable(h);
+        var mission = h.Module.Missions.GetAchieveOther(row.Steps[0].MissionId)!;
+        Assert.Equal(135, mission.AchieveType);
+        h.Player.SetTask(mission.Group, mission.Id, 0);
+        uint girlId = (uint)mission.Counts[1];
+        var girl = h.Player.GetGirl(girlId);
+        if (girl is null) { girl = new Girl { Girlid = girlId }; h.Player.Girls.Add(girl); }
+        girl.Level = (uint)mission.RequiredCount(achieveKey: true);
+        var card = h.Player.Items.Single(i => i.Guid == guid);
+        var template = h.Module.CharacterCards.Get(card.Genre, card.Detail, card.Particular, card.Level)!;
+        CardSkills.Apply(card, template, 100);
+        var before = card.Skills.Select(s => (s.SkillId, s.SkillLevel)).ToArray();
+        await RefitAsync(h, guid, 1);
+        Assert.Equal(1u, card.RefitNum);
+        var restored = h.Module.Store.Load(h.Player.Account)!.Items.Single(i => i.Guid == guid);
+        Assert.Equal(before, restored.Skills.Select(s => (s.SkillId, s.SkillLevel)).ToArray());
+        var payload = GameNotify.BuildItemInfo(restored);
+        Assert.Equal(1u, payload.Refitnum);
+        Assert.Equal(before, payload.Skillinfo.Select(s => (s.Skillid, s.Skilllevel)).ToArray());
+        ((IGamePulseFeature)h.Module.Features.OfType<MissionFeature>().Single()).OnPlayerPulse(h.Session, h.Player);
+        Assert.Equal((int)girl.Level, MissionFeature.ProgressOf(h.Player.GetTask(mission.Group, mission.Id)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RefitRequiresOtherAchievementProgressRegardlessOfClaimBit(bool claimed)
+    {
+        using var h = await FeatureHarness.CreateAsync($"card-refit-mission-{claimed}");
+        var (guid, row) = SeedRefitable(h);
+        var mission = h.Module.Missions.GetAchieveOther(row.Steps[0].MissionId)!;
+        int required = mission.RequiredCount(achieveKey: true);
+        Assert.True(required > 0);
+        h.Player.SetTask(mission.Group, mission.Id, MissionFeature.ComposeTaskValue(required - 1, claimed ? 1 : 0));
+        int gold = h.Player.GetMoney(2);
+        var items = h.Player.Items.Select(i => (i.Guid, i.Count)).ToArray();
+        await RefitAsync(h, guid, 1);
+        Assert.Equal(0u, h.Player.Items.Single(i => i.Guid == guid).RefitNum);
+        Assert.Equal(gold, h.Player.GetMoney(2));
+        Assert.Equal(items, h.Player.Items.Select(i => (i.Guid, i.Count)).ToArray());
+        int completed = MissionFeature.ComposeTaskValue(required, claimed ? 1 : 0);
+        h.Player.SetTask(mission.Group, mission.Id, completed);
+        await RefitAsync(h, guid, 1);
+        Assert.Equal(1u, h.Player.Items.Single(i => i.Guid == guid).RefitNum);
+        Assert.Equal(completed, h.Player.GetTask(mission.Group, mission.Id));
+        Assert.Equal(1u, h.Module.Store.Load(h.Player.Account)!.Items.Single(i => i.Guid == guid).RefitNum);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LockedMaterialsCannotFundBreakOrRefit(bool refit)
+    {
+        using var h = await FeatureHarness.CreateAsync($"card-lock-cost-{refit}");
+        uint guid;
+        if (refit)
+        {
+            (guid, _) = SeedRefitable(h);
+        }
+        else
+        {
+            var tpl = FirstBreakableTemplate();
+            guid = AddCard(h.Player, tpl.D, tpl.P, tpl.L);
+            var step = CardTable.Load(TestPaths.SettingDir)
+                .BreakOf(CardTable.BreakTypeOf(tpl.WeaponType, tpl.Rarity))!.Steps[0];
+            foreach (var need in step.Items) AddItem(h.Player, need.G, need.D, need.P, need.L, (uint)need.N);
+            h.Player.SetMoney(step.CurrencyId, step.CurrencyCount);
+        }
+        foreach (var item in h.Player.Items.Where(i => i.Genre != 1)) item.LockOn = 1;
+        var before = h.Player.Items.Select(i => (i.Guid, i.Count)).ToArray();
+        int gold = h.Player.GetMoney(2);
+        if (refit) await RefitAsync(h, guid, 1);
+        else await h.DispatchLuaCallAsync(CardFeature.BreakCmd, $"{{\"guid\":{guid}}}");
+        var target = h.Player.Items.Single(i => i.Guid == guid);
+        Assert.Equal(0u, target.BreakLevel);
+        Assert.Equal(0u, target.RefitNum);
+        Assert.Equal(gold, h.Player.GetMoney(2));
+        Assert.Equal(before, h.Player.Items.Select(i => (i.Guid, i.Count)).ToArray());
+    }
+
+    [Fact]
+    public async Task ConcurrentSameRefitStepChargesAndAppliesOnce()
+    {
+        using var h = await FeatureHarness.CreateAsync("card-refit-concurrent");
+        var (guid, row) = SeedRefitable(h);
+        var cost = row.Cost!.Steps[0];
+        await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => Task.Run(() => RefitAsync(h, guid, 1))));
+        Assert.Equal(1u, h.Player.Items.Single(i => i.Guid == guid).RefitNum);
+        Assert.Equal(0, h.Player.GetMoney(cost.CurrencyId));
+        foreach (var need in cost.Items)
+            Assert.DoesNotContain(h.Player.Items, i => i.Genre == need.G && i.Detail == need.D &&
+                i.Particular == need.P && i.Level == need.L && i.Count > 0);
+    }
+
+    [Fact]
+    public async Task UpgradeInsufficientGoldPreservesMaterialsAndExperience()
+    {
+        using var h = await FeatureHarness.CreateAsync("card-up-gold-fail");
+        uint guid = AddCard(h.Player, 1, 1, 3);
+        AddItem(h.Player, 7, 1, 4, 1, 3);
+        h.Player.SetMoney(CardFeature.GoldMoneyId, 0);
+        await h.DispatchLuaCallAsync(CardFeature.LevelUpCommonCmd,
+            $"{{\"guid\":{guid},\"items\":[[1,6,2]]}}");
+        Assert.NotNull(ParamOf(h, CardFeature.LevelUpCommonCmd)!["errorKey"]);
+        Assert.Equal(3u, h.Player.Items.Single(i => i.Genre == 7 && i.Detail == 1 && i.Particular == 4 && i.Level == 1).Count);
+        Assert.Equal(0u, h.Player.Items.Single(i => i.Guid == guid).EnhanceExp);
+    }
+
+    [Fact]
+    public async Task UpgradeChargesActualUnlockedMaterialCountAcrossRepeatedEntries()
+    {
+        using var h = await FeatureHarness.CreateAsync("card-up-gold-items");
+        uint guid = AddCard(h.Player, 1, 1, 3);
+        AddItem(h.Player, 7, 1, 4, 1, 3);
+        AddItem(h.Player, 7, 1, 4, 1, 10);
+        h.Player.Items.Last().LockOn = 1;
+        var template = h.Module.ItemTemplates.Get(7, 1, 4, 1)!;
+        int cost = int.Parse(template.ExtParam2) * 3;
+        h.Player.SetMoney(CardFeature.GoldMoneyId, cost);
+        await h.DispatchLuaCallAsync(CardFeature.LevelUpCommonCmd,
+            $"{{\"guid\":{guid},\"items\":[[1,6,2],[1,6,2]]}}");
+        Assert.Null(ParamOf(h, CardFeature.LevelUpCommonCmd)!["errorKey"]);
+        Assert.Equal(0, h.Player.GetMoney(CardFeature.GoldMoneyId));
+        Assert.Equal(10u, h.Player.Items.Single(i => i.Genre == 7 && i.Detail == 1 && i.Particular == 4 && i.Level == 1).Count);
+        Assert.Equal(0, h.Module.Store.Load(h.Player.Account)!.GetMoney(CardFeature.GoldMoneyId));
+    }
+
+    [Fact]
+    public async Task UpgradeChargesCardRarityBaseOnlyOnceForRepeatedGuid()
+    {
+        using var h = await FeatureHarness.CreateAsync("card-up-gold-card");
+        uint target = AddCard(h.Player, 1, 1, 3);
+        uint food = AddCard(h.Player, 2, 1, 4);
+        int cost = (int)CardTable.Load(TestPaths.SettingDir).RarityFeedBaseExp(4);
+        h.Player.SetMoney(CardFeature.GoldMoneyId, cost);
+        await h.DispatchLuaCallAsync(CardFeature.LevelUpCommonCmd,
+            $"{{\"guid\":{target},\"items\":[[2,{food},1],[2,{food},1]]}}");
+        Assert.Null(ParamOf(h, CardFeature.LevelUpCommonCmd)!["errorKey"]);
+        Assert.Equal(0, h.Player.GetMoney(CardFeature.GoldMoneyId));
+        Assert.DoesNotContain(h.Player.Items, i => i.Guid == food);
+    }
+
     /// <summary>造一张指定 GDPL 的角色卡，返回它的 guid。</summary>
     private static uint AddCard(Player p, uint d, uint particular, uint l, uint level = 1, uint breaklv = 0)
     {
@@ -200,6 +382,7 @@ public class CardFeatureTests
     {
         using var h = await FeatureHarness.CreateAsync("card-up2");
         var p = h.Player;
+        p.SetMoney(CardFeature.GoldMoneyId, 10000000);
         uint guid = AddCard(p, d: 1, particular: 1, l: 3);
         AddItem(p, 7, 1, 4, 4, 50);       // (7,1,4,4) = tbExpCard 索引 24（通用高级经验卡）
         var card = p.Items.First(i => i.Guid == guid);
@@ -238,16 +421,16 @@ public class CardFeatureTests
 
     /// <summary>
     /// ★★ 同名卡（GDPL 四元全等）**只加技能等级、不产生经验**
-    /// （<c>UI_CardMain.lua:1999..2021</c>）。技能体系本服未实现 ⇒ 等级不变，
-    /// 但素材仍被消耗、回包仍是成功（不带 errorKey）。
+    /// （<c>UI_CardMain.lua:1999..2021</c>）。素材消耗后增加3点技能提升，卡等级不变。
     /// </summary>
     [Fact]
     public async Task 升级_同名卡不加经验()
     {
         using var h = await FeatureHarness.CreateAsync("card-up4");
         var p = h.Player;
-        uint target = AddCard(p, d: 5, particular: 2, l: 3);
-        uint same = AddCard(p, d: 5, particular: 2, l: 3, level: 40);   // GDPL 全等
+        var template = h.Module.CharacterCards.All.First(t => t.P != 17 && CardSkills.Ids(t).Length >= 3);
+        uint target = AddCard(p, template.D, template.P, template.L);
+        uint same = AddCard(p, template.D, template.P, template.L, level: 40);
 
         await h.DispatchLuaCallAsync(CardFeature.LevelUpCommonCmd,
             $"{{\"guid\":{target},\"items\":[[2,{same},1]],\"clientlv\":1,\"clientSkillLv\":0}}");
@@ -255,6 +438,7 @@ public class CardFeatureTests
         var card = p.Items.First(i => i.Guid == target);
         Assert.Equal(1u, card.EnhanceLevel);
         Assert.Equal(0u, card.EnhanceExp);
+        Assert.Equal(3, CardSkills.Ids(template).Sum(id => (long)CardSkills.Level(card, id) - 1));
         Assert.DoesNotContain(p.Items, i => i.Guid == same);
         Assert.Null(ParamOf(h, CardFeature.LevelUpCommonCmd)!["errorKey"]);
     }
@@ -560,6 +744,7 @@ public class CardFeatureTests
     {
         using var h = await FeatureHarness.CreateAsync("card-order");
         var p = h.Player;
+        p.SetMoney(CardFeature.GoldMoneyId, 10000000);
         uint guid = AddCard(p, d: 1, particular: 1, l: 3);
         AddItem(p, 7, 1, 4, 4, 20);
 
@@ -647,6 +832,10 @@ public class CardFeatureTests
         card.RefitNum = (uint)(step - 1);
         // 同步率给满（★ 千分之一单位）
         card.SyncRate = enough ? (uint)(row.Steps[step - 1].NeedSync) : 0;
+        var mission = h.Module.Missions.GetAchieveOther(row.Steps[step - 1].MissionId);
+        if (mission is not null)
+            h.Player.SetTask(mission.Group, mission.Id,
+                MissionFeature.ComposeTaskValue(mission.RequiredCount(achieveKey: true), 0));
 
         if (enough)
         {
@@ -657,6 +846,51 @@ public class CardFeatureTests
                 AddItem(h.Player, need.G, need.D, need.P, need.L, (uint)need.N);
         }
         return (guid, row);
+    }
+
+    [Theory]
+    [InlineData("guid", "fraction")]
+    [InlineData("guid", "string")]
+    [InlineData("refitNum", "fraction")]
+    [InlineData("refitNum", "string")]
+    [InlineData("card", "zero")]
+    public async Task InvalidRefitCannotConsumeOrModifyCard(string field, string shape)
+    {
+        using var h = await FeatureHarness.CreateAsync("refit-request-boundary");
+        var (guid, row) = SeedRefitable(h);
+        var card = h.Player.Items.First(i => i.Guid == guid);
+        if (field == "card") card.Count = 0;
+        long total = h.Player.Items.Sum(i => (long)i.Count);
+        var cost = row.Cost!.Steps[0];
+        long money = h.Player.GetMoney(cost.CurrencyId);
+        string guidJson = field == "guid" ? shape == "string" ? $"\"{guid}\"" : $"{guid}.5" : guid.ToString();
+        string stepJson = field == "refitNum" ? shape == "string" ? "\"1\"" : "1.5" : "1";
+        await h.DispatchLuaCallAsync(CardFeature.RefitCmd, $"{{\"guid\":{guidJson},\"refitNum\":{stepJson}}}");
+        Assert.Equal(0u, card.RefitNum);
+        Assert.Equal(money, h.Player.GetMoney(cost.CurrencyId));
+        Assert.Equal(total, h.Player.Items.Sum(i => (long)i.Count));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UpgradeRejectsFractionalGuidOrZeroQuantityWithoutConsuming(bool zeroCount)
+    {
+        using var h = await FeatureHarness.CreateAsync("card-upgrade-target-boundary");
+        uint guid = AddCard(h.Player, 1, 1, 3);
+        var target = h.Player.Items.First(i => i.Guid == guid);
+        if (zeroCount) target.Count = 0;
+        AddItem(h.Player, 7, 1, 1, 1, 10);
+        string guidJson = zeroCount ? guid.ToString() : $"{guid}.5";
+        long materials = h.Player.Items.Where(i => i.Genre == 7).Sum(i => (long)i.Count);
+        int gold = h.Player.GetMoney(CardFeature.GoldMoneyId);
+        await h.DispatchLuaCallAsync(CardFeature.LevelUpCommonCmd,
+            $"{{\"guid\":{guidJson},\"items\":[[1,1,5]],\"clientlv\":1,\"clientSkillLv\":0}}");
+        Assert.NotNull(ParamOf(h, CardFeature.LevelUpCommonCmd)!["errorKey"]);
+        Assert.Equal(1u, target.EnhanceLevel);
+        Assert.Equal(0u, target.EnhanceExp);
+        Assert.Equal(materials, h.Player.Items.Where(i => i.Genre == 7).Sum(i => (long)i.Count));
+        Assert.Equal(gold, h.Player.GetMoney(CardFeature.GoldMoneyId));
     }
 
     private static Task RefitAsync(FeatureHarness h, uint guid, int refitNum)

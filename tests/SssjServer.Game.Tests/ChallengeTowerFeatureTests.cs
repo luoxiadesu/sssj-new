@@ -119,7 +119,7 @@ public class ChallengeTowerFeatureTests
     [Fact]
     public async Task 取塔信息回ActivityType6()
     {
-        using var h = await FeatureHarness.CreateAsync("ct-gettower");
+        using var h = await ChallengeTestHarness.CreateAsync("ct-gettower");
 
         await h.DispatchLuaCallAsync(ChallengeTowerFeature.CmdGetTower, "{}");
 
@@ -135,10 +135,10 @@ public class ChallengeTowerFeatureTests
     [Fact]
     public async Task 进关回位置数组形式的tbData()
     {
-        using var h = await FeatureHarness.CreateAsync("ct-enter");
+        using var h = await ChallengeTestHarness.CreateAsync("ct-enter");
 
         // 上行位置数组：[type, 塔Id, NodeId, LevelId, 编队Id]
-        await h.DispatchLuaCallAsync(ChallengeTowerFeature.CmdEnterTower, "[6,349,907,1,1]");
+        await h.DispatchLuaCallAsync(ChallengeTowerFeature.CmdEnterTower, "[6,349,907,2153,1]");
 
         var r = Reply(h, ChallengeTowerFeature.CmdEnterTower);
         Assert.NotNull(r);
@@ -147,14 +147,14 @@ public class ChallengeTowerFeatureTests
         Assert.Equal(6, arr[0]!.GetValue<int>());
         Assert.Equal(349, arr[1]!.GetValue<int>());
         Assert.Equal(907, arr[2]!.GetValue<int>());
-        Assert.Equal(1, arr[3]!.GetValue<int>());
+        Assert.Equal(2153, arr[3]!.GetValue<int>());
     }
 
     /// <summary>★ 非排行塔类型（其它已过期塔玩法）要忽略、不回包。</summary>
     [Fact]
     public async Task 非排行塔类型被忽略()
     {
-        using var h = await FeatureHarness.CreateAsync("ct-othertype");
+        using var h = await ChallengeTestHarness.CreateAsync("ct-othertype");
         int before = h.Outbound.Count;
 
         await h.DispatchLuaCallAsync(ChallengeTowerFeature.CmdEnterTower, "[2,1,0,1,1]");
@@ -170,9 +170,10 @@ public class ChallengeTowerFeatureTests
     [Fact]
     public async Task 通关回包的isPass是布尔()
     {
-        using var h = await FeatureHarness.CreateAsync("ct-pass");
+        using var h = await ChallengeTestHarness.CreateAsync("ct-pass");
 
-        await h.DispatchLuaCallAsync(ChallengeTowerFeature.CmdPassTower, "[6,349,907,1,1]");
+        await h.DispatchLuaCallAsync(ChallengeTowerFeature.CmdEnterTower, "[6,349,907,2153,1]");
+        await ChallengeTestHarness.SettleAsync(h,ChallengeTowerFeature.CmdPassTower, "[6,349,907,2153,1,{\"isPass\":true}]");
 
         var r = Reply(h, ChallengeTowerFeature.CmdPassTower);
         Assert.NotNull(r);
@@ -185,7 +186,7 @@ public class ChallengeTowerFeatureTests
     [Fact]
     public async Task 失败塔回空包()
     {
-        using var h = await FeatureHarness.CreateAsync("ct-fail");
+        using var h = await ChallengeTestHarness.CreateAsync("ct-fail");
 
         await h.DispatchLuaCallAsync(ChallengeTowerFeature.CmdFailTower, "{}");
 
@@ -201,7 +202,7 @@ public class ChallengeTowerFeatureTests
     [Fact]
     public async Task 领积分奖励回res为true并记已领档位()
     {
-        using var h = await FeatureHarness.CreateAsync("ct-award");
+        using var h = await ChallengeTestHarness.CreateAsync("ct-award");
         var t = Table();
         var first = t.Rewards[0];
         SetTask(h, ChallengeTable.TaskTotalScore, first.Goal);
@@ -222,7 +223,7 @@ public class ChallengeTowerFeatureTests
     [Fact]
     public async Task 无可领档位时回res为false()
     {
-        using var h = await FeatureHarness.CreateAsync("ct-award-none");
+        using var h = await ChallengeTestHarness.CreateAsync("ct-award-none");
         SetTask(h, ChallengeTable.TaskTotalScore, 0);
 
         await h.DispatchLuaCallAsync(ChallengeTowerFeature.CmdAwardSome, "{}");
@@ -237,7 +238,7 @@ public class ChallengeTowerFeatureTests
     [Fact]
     public async Task 重复领取被拒绝()
     {
-        using var h = await FeatureHarness.CreateAsync("ct-award-twice");
+        using var h = await ChallengeTestHarness.CreateAsync("ct-award-twice");
         var first = Table().Rewards[0];
         SetTask(h, ChallengeTable.TaskTotalScore, first.Goal);
 
@@ -252,7 +253,7 @@ public class ChallengeTowerFeatureTests
     [Fact]
     public async Task 高分时可一次领多档()
     {
-        using var h = await FeatureHarness.CreateAsync("ct-award-many");
+        using var h = await ChallengeTestHarness.CreateAsync("ct-award-many");
         var t = Table();
         // 给足够覆盖前 3 档的分数
         int goal3 = t.Rewards.Take(3).Max(r => r.Goal);
@@ -267,22 +268,23 @@ public class ChallengeTowerFeatureTests
 
     /// <summary>★ 207 上行是**裸布尔**，保留时推任务值。</summary>
     [Fact]
-    public async Task 保留成绩回包并推任务值()
+    public async Task 无场次令牌的保留请求不能修改积分()
     {
-        using var h = await FeatureHarness.CreateAsync("ct-save");
+        using var h = await ChallengeTestHarness.CreateAsync("ct-save");
         SetTask(h, ChallengeTable.TaskTotalScore, 5000);
 
         await h.DispatchLuaCallAsync(ChallengeTowerFeature.CmdExitSave, "true");
 
         Assert.NotNull(Reply(h, ChallengeTowerFeature.CmdExitSave));
-        Assert.True(await h.WaitForPfAsync(GamePf.TaskValueSyncRsp));
+        Assert.NotNull(Reply(h, ChallengeTowerFeature.CmdExitSave)!["nError"]);
+        Assert.Equal(5000, h.Player.GetTask(9, ChallengeTable.TaskTotalScore));
     }
 
     /// <summary>★ 放弃（false）也要回包（否则退出流程的回调不执行、界面卡住）。</summary>
     [Fact]
     public async Task 放弃成绩也要回包()
     {
-        using var h = await FeatureHarness.CreateAsync("ct-save-no");
+        using var h = await ChallengeTestHarness.CreateAsync("ct-save-no");
         int before = h.Outbound.Count;
 
         await h.DispatchLuaCallAsync(ChallengeTowerFeature.CmdExitSave, "false");
@@ -327,7 +329,7 @@ public class ChallengeTowerFeatureTests
     [InlineData(ChallengeTowerFeature.CmdExitSave, "[]")]
     public async Task 排行塔命令非法参数不崩(int cmd, string json)
     {
-        using var h = await FeatureHarness.CreateAsync($"ct-bad-{cmd}-{json.GetHashCode()}");
+        using var h = await ChallengeTestHarness.CreateAsync($"ct-bad-{cmd}-{json.GetHashCode()}");
 
         await h.DispatchLuaCallAsync(cmd, json);
         Assert.True(true);      // 不抛即通过

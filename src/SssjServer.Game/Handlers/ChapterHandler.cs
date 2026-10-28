@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text.Json.Nodes;
 using SssjServer.Core;
 using SssjServer.Game.Config;
@@ -57,6 +58,26 @@ public sealed class ChapterHandler
     /// <summary>体力不足的客户端错误码（MoneyDef.txt 体力行「通用错误」列 = 20014，UI 文本 ui.Error.20014）。</summary>
     public const int ErrNoVigour = 20014;
 
+    private readonly ConditionalWeakTable<ClientSession, Attempt> _attempts = new();
+    private sealed class Attempt
+    {
+        internal Player Player = null!;
+        internal uint Map;
+        internal string Token = Guid.NewGuid().ToString("N");
+        internal bool Cancelled;
+        internal int SpentVigour;
+        internal uint[] MainCards = Array.Empty<uint>();
+        internal BattleMainCard[] CardIdentities = Array.Empty<BattleMainCard>();
+        internal Dictionary<int, int> PledgeSteps = new();
+        internal object? Settlement;
+    }
+    private readonly MissionTable _missions;
+    private readonly PledgeTable _pledge;
+    private readonly CardTable _cards;
+    private readonly CharacterCardTable _cardTemplates;
+    private readonly PlayerExpTable _playerExp;
+    private readonly GirlLoveTable _girlLove;
+    private readonly CafeTable _cafe;
     private readonly PlayerStore _store;
     private readonly LuaCallRouter _luaCalls;
     private readonly ChapterTable _chapters;
@@ -82,8 +103,15 @@ public sealed class ChapterHandler
     public ChapterHandler(PlayerStore store, LuaCallRouter luaCalls, ChapterTable chapters, bool spendVigour,
                           RewardService? rewards = null,
                           ChapterRandomAwardTable? randomAwards = null,
-                          bool grantRandomAward = false)
+                          bool grantRandomAward = false, CafeTable? cafe = null, GirlLoveTable? girlLove = null, PlayerExpTable? playerExp = null, CardTable? cards = null, CharacterCardTable? cardTemplates = null, MissionTable? missions = null, PledgeTable? pledge = null)
     {
+        _missions = missions ?? MissionTable.Empty;
+        _pledge = pledge ?? PledgeTable.Empty;
+        _cards = cards ?? CardTable.Empty;
+        _cardTemplates = cardTemplates ?? CharacterCardTable.Empty;
+        _playerExp = playerExp ?? PlayerExpTable.Empty;
+        _girlLove = girlLove ?? GirlLoveTable.Empty;
+        _cafe = cafe ?? CafeTable.Empty;
         _store = store;
         _luaCalls = luaCalls;
         _chapters = chapters;
@@ -103,6 +131,12 @@ public sealed class ChapterHandler
 
     private Task Handle(ClientSession session, JsonNode? param, bool viaDoSettle)
     {
+        if (session.Tag is not Player player) return Task.CompletedTask;
+        lock (player) return HandleLocked(session, param, viaDoSettle);
+    }
+
+    private Task HandleLocked(ClientSession session, JsonNode? param, bool viaDoSettle)
+    {
         if (session.Tag is not Player player)
         {
             Log.Warn($"[session {session.Id}] ChapterMsg 到达但会话未登录（Tag 非 Player），忽略");
@@ -117,9 +151,11 @@ public sealed class ChapterHandler
         switch (state)
         {
             case 0:
-                return HandleEnter(session, player, chapter, index, diff, viaDoSettle);
+                return HandleEnter(session, player, param, chapter, index, diff, viaDoSettle);
             case 1:
                 return HandleFinish(session, player, param, chapter, index, diff, viaDoSettle);
+            case 3:
+                return HandleCancel(session, player, param, chapter, index, diff, viaDoSettle);
             case 2:
                 return HandleChapterAward(session, player, param, chapter, diff, viaDoSettle);
             default:
@@ -129,10 +165,28 @@ public sealed class ChapterHandler
     }
 
     // ---- nState=0 进入关卡 ----
-    private Task HandleEnter(ClientSession session, Player player, int chapter, int index, int diff, bool viaDoSettle)
+    private Task HandleEnter(ClientSession session, Player player, JsonNode? param, int chapter, int index, int diff, bool viaDoSettle)
     {
         var cfg = _chapters.Get(chapter, index, diff);
-        int cost = cfg?.TotalVigour ?? 0;
+        if (cfg is null || cfg.Chapter != chapter || cfg.Index != index || cfg.Diff != diff)
+        {
+            Reply(session, viaDoSettle, new { nError = 1, nState = 0 });
+            return Task.CompletedTask;
+        }
+        uint map = cfg.MapId;
+        if (_attempts.TryGetValue(session, out var pending) && ReferenceEquals(pending.Player, player)
+            && pending.Map == map && pending.Settlement is null && !pending.Cancelled)
+        {
+            Reply(session, viaDoSettle, new { nError = 0, nState = 0, battleToken = pending.Token });
+            return Task.CompletedTask;
+        }
+        uint[] mainCards = SnapshotMainCards(player, param, out bool validFormation);
+        if (!validFormation)
+        {
+            Reply(session, viaDoSettle, new { nError = 1, nState = 0 });
+            return Task.CompletedTask;
+        }
+        int cost = cfg.TotalVigour;
 
         if (_spendVigour && cost > 0 && !player.TrySpendVigour(cost))
         {
@@ -147,12 +201,17 @@ public sealed class ChapterHandler
             GameNotify.PushMoney(session, player, MoneyType.Vigour);
         }
 
+        _attempts.Remove(session);
+        var attempt = new Attempt { Player = player, Map = map, SpentVigour = _spendVigour ? Math.Max(0, cost) : 0, MainCards = mainCards };
+        attempt.CardIdentities = mainCards.Select(g => BattleMainCard.From(player.Items.First(i => i.Guid == g))).ToArray();
+        attempt.PledgeSteps = PledgeFeature.LoadStateStatic(player).Girls.ToDictionary(k => k.Key, k => k.Value.Step);
+        _attempts.Add(session, attempt);
         Log.Info($"[session {session.Id}] 进关 {chapter}-{index}(diff{diff}) " +
                  $"scene={cfg?.SceneMapId ?? -1} 体力-{(_spendVigour ? cost : 0)} 余{player.Vigour}");
 
         // tbEnter/tbDropItems 不下发：LevelManager:SetDropInfo 对 nil 完全安全
         // （`if tbDrop then` / `tbOthers or {}`），怪物掉落由客户端配置自算。
-        Reply(session, viaDoSettle, new { nError = 0, nState = 0 });
+        Reply(session, viaDoSettle, new { nError = 0, nState = 0, battleToken = attempt.Token });
         return Task.CompletedTask;
     }
 
@@ -161,7 +220,44 @@ public sealed class ChapterHandler
                               int chapter, int index, int diff, bool viaDoSettle)
     {
         var cfg = _chapters.Get(chapter, index, diff);
-        int starMask = MapList.Stars(ReadInt(param, "nStar", 0));
+        if (cfg is null || cfg.Chapter != chapter || cfg.Index != index || cfg.Diff != diff
+            || !_attempts.TryGetValue(session, out var attempt) || !ReferenceEquals(attempt.Player, player)
+            || attempt.Map != cfg.MapId || attempt.Cancelled
+            || !HasToken(param, attempt))
+        {
+            Reply(session, viaDoSettle, new { nError = 1, nState = 1, battleToken = (param as JsonObject)?["battleToken"]?.ToString() });
+            return Task.CompletedTask;
+        }
+        // The original nStar=0 also means a valid victory without star goals.
+        // Only the patched client's explicit boolean disambiguates victory and defeat.
+        if ((param as JsonObject)?["bSuccess"] is not JsonValue outcome || !outcome.TryGetValue<bool>(out bool success))
+        {
+            Reply(session, viaDoSettle, new { nError = 1, nState = 1, battleToken = (param as JsonObject)?["battleToken"]?.ToString() });
+            return Task.CompletedTask;
+        }
+        if (attempt.Settlement is not null)
+        {
+            Reply(session, viaDoSettle, attempt.Settlement);
+            return Task.CompletedTask;
+        }
+        int rawStars = ReadInt(param, "nStar", -1);
+        if (rawStars < 0 || rawStars > MapList.StarMask)
+        {
+            Reply(session, viaDoSettle, new { nError = 1, nState = 1, battleToken = (param as JsonObject)?["battleToken"]?.ToString() });
+            return Task.CompletedTask;
+        }
+        if (!success)
+        {
+            attempt.Settlement = new
+            {
+                nError = 0, nState = 1, nStar = player.GetLevelStar(cfg.MapId),
+                tbExp = new { MasterExp = 0, CardExp = 0 }, tbAwards = Array.Empty<int[]>(),
+                bSuccess = false, battleToken = attempt.Token,
+            };
+            Reply(session, viaDoSettle, attempt.Settlement);
+            return Task.CompletedTask;
+        }
+        int starMask = rawStars;
         uint mapId = MapList.MapId(chapter, index, diff);
         bool firstClear = MapList.PassCount(player.GetLevelStar(mapId)) == 0;
 
@@ -170,7 +266,7 @@ public sealed class ChapterHandler
         int masterExp = cfg?.MasterExp ?? 0;
         int cardExp = cfg?.CardExp ?? 0;
         if (masterExp > 0)
-            player.Exp += masterExp;
+            PlayerProgress.AddMasterExp(player, _playerExp, masterExp);
 
         // Diamond / RewardGold 是 Chapter.txt 里与 FixedAward 并列的两列（钻石奖励 / 金币奖励）。
         // 现网 495 行里这两列**全为空**（实测），关卡的金币实际来自 FixedAward 的 (15,1,1,1)，
@@ -202,6 +298,21 @@ public sealed class ChapterHandler
             }
         }
 
+        var combatChanges = ChapterCombatProgress.RecordVictory(_missions, _pledge, player, chapter, index, diff,
+            attempt.CardIdentities, attempt.PledgeSteps);
+        var trainedCards = GrantBattleCardExp(player, attempt.MainCards, cardExp);
+        attempt.Settlement = new
+        {
+            nError = 0,
+            nState = 1,
+            bSuccess = true, battleToken = attempt.Token,
+            nStar = composed,
+            tbExp = new { MasterExp = masterExp, CardExp = cardExp },
+            // tbAwards：数组的数组 {G,D,P,L,N,Flag}（形状取证见 GrantedReward.ToTuple）
+            tbAwards = granted.ToAwardTuples(),
+        };
+        var coffeeChanges = CafeBizFeature.RefreshCoffeeConditions(_cafe, player);
+        var girlStoryChanges = GirlLoveFeature.UnlockStories(_girlLove, player);
         _store.Save(player);
 
         Log.Info($"[session {session.Id}] 通关 {chapter}-{index}(diff{diff}) star={starMask} " +
@@ -212,6 +323,10 @@ public sealed class ChapterHandler
 
         // 关卡进度增量推送（pf 1034 → Game.Player.OnChapterChange → MapList.ReflashLevelList）
         GameNotify.PushChapter(session, mapId, composed);
+        if (combatChanges.Count > 0) GameNotify.PushTaskValues(session, combatChanges);
+        if (masterExp > 0) GameNotify.PushLevelExp(session, player);
+        if (coffeeChanges.Count > 0) GameNotify.PushTaskValues(session, coffeeChanges);
+        if (girlStoryChanges.Count > 0) GameNotify.PushTaskValues(session, girlStoryChanges);
 
         // 货币增量：每种变动的货币一条 pf 1032（MoneyUpdateNtf 只有一个 Info 字段，无法批量）。
         // RewardGold/Diamond 两列即便被填上也要推，所以先并进集合再统一推，避免重复。
@@ -224,19 +339,85 @@ public sealed class ChapterHandler
 
         // 背包增量：一条 pf 1031 ItemUpdateNtf 带上全部变动实例（客户端
         // Game.EquipManager.OnUpdateItem 逐条 upsert，count 是绝对值 —— 见 GameNotify.PushItems）
-        GameNotify.PushItems(session, granted.ChangedItems);
+        GameNotify.PushItems(session, granted.ChangedItems.Concat(trainedCards).Distinct().ToList());
 
         // nStar 必须是**完整位域**：客户端 Chapter.lua:GameEnd 直接
         // CS.Game.MapList.ReflashLevelList(nCurrMapId, tbStar) 整值覆盖本地字典。
-        Reply(session, viaDoSettle, new
+        Reply(session, viaDoSettle, attempt.Settlement);
+        return Task.CompletedTask;
+    }
+
+    // The current client animates the three MainCharacterCard entries; do not infer
+    // extra experience for secondary cards, appearance overrides or friend assists.
+    internal static uint[] SnapshotMainCards(Player player, JsonNode? param, out bool valid)
+    {
+        bool explicitId = (param as JsonObject)?.ContainsKey("nFormationId") == true;
+        int id = ReadInt(param, "nFormationId", 1);
+        var formation = player.Formations.FirstOrDefault(f => f.Id == id);
+        valid = !explicitId || id > 0 && formation is not null;
+        if (!valid || formation is null) return Array.Empty<uint>();
+        var ids = formation.Slots.Select(s => s.MainCardGuid).Where(g => g != 0).ToArray();
+        valid = ids.Length <= 3 && (!explicitId || ids.Length > 0) && ids.Distinct().Count() == ids.Length
+            && ids.All(g => player.Items.Any(i => i.Guid == g && i.Genre == 1 && i.Count > 0));
+        return valid ? ids.ToArray() : Array.Empty<uint>();
+    }
+
+    private List<Item> GrantBattleCardExp(Player player, uint[] guids, int gain)
+    {
+        var changed = new List<Item>();
+        if (gain <= 0) return changed;
+        foreach (uint guid in guids)
         {
-            nError = 0,
-            nState = 1,
-            nStar = composed,
-            tbExp = new { MasterExp = masterExp, CardExp = cardExp },
-            // tbAwards：数组的数组 {G,D,P,L,N,Flag}（形状取证见 GrantedReward.ToTuple）
-            tbAwards = granted.ToAwardTuples(),
-        });
+            var item = player.Items.FirstOrDefault(i => i.Guid == guid && i.Genre == 1 && i.Count > 0);
+            // Pledge cards grow exclusively from their pledge stage configuration.
+            if (item is null || item.Particular == CardFeature.PldgeCardParticular) continue;
+            var template = _cardTemplates.Get(item.Genre, item.Detail, item.Particular, item.Level);
+            if (template is null) continue;
+            int cap = _cards.MaxLevelFor(CardTable.BreakTypeOf(template.WeaponType, template.Rarity), (int)item.BreakLevel);
+            int level = (int)item.EnhanceLevel;
+            // Do not downgrade legacy cards already above the current break cap.
+            if (cap <= 0 || level > cap) continue;
+            var next = _cards.ApplyExp(level, item.EnhanceExp, gain, cap, template.ExpType);
+            item.EnhanceLevel = (uint)next.Level;
+            item.EnhanceExp = (uint)Math.Min(uint.MaxValue, next.Exp);
+            changed.Add(item);
+        }
+        return changed;
+    }
+
+    private static bool HasToken(JsonNode? param, Attempt attempt)
+        => (param as JsonObject)?["battleToken"] is JsonValue value
+            && value.TryGetValue<string>(out var token) && token == attempt.Token;
+
+    // Local protocol extension used only by the patched mainline pause/restart UI.
+    private Task HandleCancel(ClientSession session, Player player, JsonNode? param,
+        int chapter, int index, int diff, bool viaDoSettle)
+    {
+        if (!_attempts.TryGetValue(session, out var attempt) || !ReferenceEquals(attempt.Player, player)
+            || MapList.Decode(attempt.Map) != (chapter, index, diff) || !HasToken(param, attempt)
+            || attempt.Settlement is not null)
+        {
+            Reply(session, viaDoSettle, new { nError = 1, nState = 3 });
+            return Task.CompletedTask;
+        }
+        // Refund only this attempt's actual debit; never recompute from mutable config.
+        if (!attempt.Cancelled)
+        {
+            int previous = player.Vigour;
+            player.SetMoney(MoneyType.Vigour, (int)Math.Min(int.MaxValue, (long)previous + attempt.SpentVigour));
+            attempt.Cancelled = true;
+            try { _store.Save(player); }
+            catch
+            {
+                player.SetMoney(MoneyType.Vigour, previous);
+                attempt.Cancelled = false;
+                throw;
+            }
+            Log.Info($"[session {session.Id}] 主线退出返还电力 {attempt.SpentVigour}，当前 {player.Vigour}");
+        }
+        // Also resend the absolute balance for a repeated acknowledgement.
+        GameNotify.PushMoney(session, player, MoneyType.Vigour);
+        Reply(session, viaDoSettle, new { nError = 0, nState = 3, battleToken = attempt.Token });
         return Task.CompletedTask;
     }
 
@@ -264,7 +445,7 @@ public sealed class ChapterHandler
 
     private static int ReadInt(JsonNode? node, string name, int fallback)
     {
-        var v = node?[name];
+        var v = (node as JsonObject)?[name];
         if (v is null)
             return fallback;
         try
@@ -274,7 +455,7 @@ public sealed class ChapterHandler
         catch
         {
             // Lua 侧可能给 float/字符串，兜一层
-            return double.TryParse(v.ToString(), out var d) ? (int)d : fallback;
+            return int.TryParse(v.ToString(), out int parsed) ? parsed : fallback;
         }
     }
 }

@@ -1156,8 +1156,10 @@ public class ShopFeatureTests
         var reply = LastLuaCallObject(h, ShopFeature.CmdReqBuyGoods);
         Assert.Equal(3, reply["buynum"]!.GetValue<int>());
         Assert.Equal(10_000 - CafePriceA * 3, h.Player.GetMoney(MoneyType.CoffeeCoin));
-        Assert.Equal(3u, h.Player.Items.Single(i => i.Genre == 11 && i.Detail == 1
-                                                 && i.Particular == 1 && i.Level == 1).Count);
+        var furniture = HouseFeature.ReadOrCreate(h.Player, HouseTable.Load(TestPaths.SettingDir)).Furniture;
+        Assert.Equal(3, furniture.Count(f => f.TemplateId == 101 && f.RoomId == 0));
+        Assert.DoesNotContain(h.Player.Items, i => i.Genre == 11 && i.Detail == 1 && i.Particular == 1);
+        Assert.True(await h.WaitForPfAsync(SssjServer.Protocol.Pf.AddFornituresRsp));
     }
 
     // =====================================================================
@@ -1188,8 +1190,11 @@ public class ShopFeatureTests
         });
 
         Assert.Equal(10_000 - CafePriceA - CafePriceB, h.Player.GetMoney(MoneyType.CoffeeCoin));
-        Assert.Equal(1u, h.Player.Items.Single(i => i.Genre == 11 && i.Particular == 1).Count);
-        Assert.Equal(1u, h.Player.Items.Single(i => i.Genre == 11 && i.Particular == 2).Count);
+        var furniture = HouseFeature.ReadOrCreate(h.Player, HouseTable.Load(TestPaths.SettingDir)).Furniture;
+        Assert.Single(furniture, f => f.TemplateId == 101 && f.RoomId == 0);
+        Assert.Single(furniture, f => f.TemplateId == 102 && f.RoomId == 0);
+        Assert.DoesNotContain(h.Player.Items, i => i.Genre == 11);
+        Assert.True(await h.WaitForPfAsync(SssjServer.Protocol.Pf.AddFornituresRsp));
     }
 
     /// <summary>

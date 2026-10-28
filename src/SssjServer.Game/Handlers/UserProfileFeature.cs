@@ -35,16 +35,12 @@ namespace SssjServer.Game.Handlers;
 /// ⇒ 71 回 <c>["签名"]</c>，73 回 <c>[卡guid, …]</c>，77 回 <c>[武器guid, …]</c>，
 /// 各最多 3 个（界面就 3 个槽，`{0,0,0}`）。
 ///
-/// <para><b>2. 三个消费点都有 nil 保护 ⇒ 空数组是新号的正解</b></para>
-/// `#tbParam &gt; 0` / `if tbParam` + 内部 `{0,0,0}` 兜底 —— 回 <c>[]</c> 甚至回 nil 都不崩。
-/// 这在本项目里少见（多数域少个字段就直接抛），所以这一族**没有静默失败风险**。
+/// <para><b>2. 展示槽必须保留空位</b></para>
+/// UI_ShowCardSelect.CheckCardChange 上传三个固定位置，0代表空槽；UI_User按数组下标绘制。
+/// 因此展示卡/武器回包固定三个元素，失效实例原位归零，不把后续槽位前移。
 ///
-/// <para><b>3. ★ 展示武器现在只能回空数组</b></para>
-/// 服务端还不能下发 genre 2 武器（`docs/05` §0.3 的
-/// `skillinfo`/`weaponinlay`/`attrlist`/`ownguid` 四字段红线），玩家背包里没有武器实例，
-/// 回一个 guid 只会让 `Game.EquipManager.GetWeapon` 返回 nil、那个槽画成空。
-/// 所以 <see cref="OnGetExhibitionWeapon"/> 会把存档里的 guid **过滤成实际持有的**，
-/// 新号自然就是 <c>[]</c>。等武器域落地后无需改这里。
+/// <para><b>3. 展示实例以实际持有状态为准</b></para>
+/// 卡片/武器分别要求genre 1/2、正数量；重复或无效guid原位归零。
 ///
 /// <para><b>4. 签名不需要服务端过滤</b></para>
 /// 客户端自己过 <c>Game.TextFilter.Instance:Filter</c>（`UI_User.lua:1343`），
@@ -147,12 +143,7 @@ public sealed class UserProfileFeature : IGameFeature
         if (session.Tag is not Player player)
             return Task.CompletedTask;
 
-        var guids = ReadSlots(player, "cards")
-            // 只回**实际持有**的卡：客户端 GetCharacterCard 拿不到就把槽画空，
-            // 回一个已经不存在的 guid 等于白占一个槽
-            .Where(g => player.Items.Any(i => i.Guid == g && i.Genre == 1))
-            .Take(ExhibitionSlots)
-            .ToList();
+        var guids = OwnedSlots(player, ReadSlots(player, "cards"), 1);
 
         Reply(session, cmd, ToArray(guids));
         Log.Info($"[session {session.Id}] Player_GetExhibitionItem → [{string.Join(",", guids)}]");
@@ -164,7 +155,12 @@ public sealed class UserProfileFeature : IGameFeature
         if (session.Tag is not Player player)
             return Task.CompletedTask;
 
-        var guids = ParseGuids(param).Take(ExhibitionSlots).ToList();
+        if (GuidArray(param) is null)
+        {
+            Reply(session, cmd, ToArray(OwnedSlots(player, ReadSlots(player, "cards"), 1)));
+            return Task.CompletedTask;
+        }
+        var guids = OwnedSlots(player, ParseGuids(param), 1);
         WriteProfile(player, p => p["cards"] = ToArray(guids));
         _ctx.Store.Save(player);
 
@@ -180,16 +176,11 @@ public sealed class UserProfileFeature : IGameFeature
         if (session.Tag is not Player player)
             return Task.CompletedTask;
 
-        // ★ 过滤成实际持有的 genre 2 武器。服务端目前不下发武器（docs/05 §0.3），
-        // 所以新号这里必然是空数组 —— 那正是客户端期望的「三个空槽」。
-        var guids = ReadSlots(player, "weapons")
-            .Where(g => player.Items.Any(i => i.Guid == g && i.Genre == 2))
-            .Take(ExhibitionSlots)
-            .ToList();
+        // Keep all three positions, including empty/expired references.
+        var guids = OwnedSlots(player, ReadSlots(player, "weapons"), 2);
 
         Reply(session, cmd, ToArray(guids));
-        Log.Info($"[session {session.Id}] Player_GetExhibitionWeapon → [{string.Join(",", guids)}]" +
-                 (guids.Count == 0 ? "（服务端还不下发 genre 2 武器，空是预期）" : ""));
+        Log.Info($"[session {session.Id}] Player_GetExhibitionWeapon → [{string.Join(",", guids)}]");
         return Task.CompletedTask;
     }
 
@@ -198,7 +189,12 @@ public sealed class UserProfileFeature : IGameFeature
         if (session.Tag is not Player player)
             return Task.CompletedTask;
 
-        var guids = ParseGuids(param).Take(ExhibitionSlots).ToList();
+        if (GuidArray(param) is null)
+        {
+            Reply(session, cmd, ToArray(OwnedSlots(player, ReadSlots(player, "weapons"), 2)));
+            return Task.CompletedTask;
+        }
+        var guids = OwnedSlots(player, ParseGuids(param), 2);
         WriteProfile(player, p => p["weapons"] = ToArray(guids));
         _ctx.Store.Save(player);
 
@@ -224,10 +220,7 @@ public sealed class UserProfileFeature : IGameFeature
         {
             foreach (var item in arr)
             {
-                if (item is null)
-                    continue;
-                if (uint.TryParse(item.ToString(), out var g) && g > 0)
-                    result.Add(g);
+                result.Add(uint.TryParse(item?.ToString(), out var g) ? g : 0);
             }
         }
         return result;
@@ -248,6 +241,15 @@ public sealed class UserProfileFeature : IGameFeature
     internal static List<uint> ParseGuids(JsonNode? param)
     {
         var result = new List<uint>();
+        var arr = GuidArray(param);
+        if (arr is null) return result;
+        foreach (var item in arr.Take(ExhibitionSlots))
+            result.Add(item is JsonValue value && value.TryGetValue<uint>(out var g) ? g : 0);
+        return result;
+    }
+
+    private static JsonArray? GuidArray(JsonNode? param)
+    {
         JsonArray? arr = param as JsonArray;
         if (arr is null && param is JsonObject o)
         {
@@ -260,17 +262,16 @@ public sealed class UserProfileFeature : IGameFeature
                 }
             }
         }
-        if (arr is null)
-            return result;
+        return arr;
+    }
 
-        foreach (var item in arr)
-        {
-            if (item is null)
-                continue;
-            if (uint.TryParse(item.ToString(), out var g) && g > 0)
-                result.Add(g);
-        }
-        return result;
+    private static List<uint> OwnedSlots(Player player, IEnumerable<uint> requested, uint genre)
+    {
+        var owned = player.Items.Where(i => i.Genre == genre && i.Count > 0).Select(i => i.Guid).ToHashSet();
+        var seen = new HashSet<uint>();
+        var slots = requested.Take(ExhibitionSlots).Select(g => g > 0 && owned.Contains(g) && seen.Add(g) ? g : 0u).ToList();
+        while (slots.Count < ExhibitionSlots) slots.Add(0);
+        return slots;
     }
 
     private static JsonArray ToArray(IEnumerable<uint> values)

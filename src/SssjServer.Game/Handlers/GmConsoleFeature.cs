@@ -41,6 +41,14 @@ public sealed class GmConsoleFeature : IGameFeature
     public void Install(GameFeatureContext ctx)
     {
         GmConsole.Attach(ctx.World, ctx.LuaCalls);
+        var rotation = Config.GachaRotation.For(ctx.Options.SettingDirectory);
+        ctx.OnPlayerLogin((session, player) =>
+        {
+            // A persisted disabled plan must also restore dates on reconnect
+            // when the client Lua VM survived the server restart.
+            if (rotation.HasConfiguration || rotation.Read().Enabled)
+                ctx.LuaCalls.CallClient(session, DoLuaStringCmd, new { luaStr = rotation.ClientLua() });
+        });
 
         // 上行的 sFunction="DebugEditor"（原服 GM 通道，参数是 Lua 源码）由
         // GmDebugEditorFeature 用 MapRawFunction 处理 —— 那条通道的 sJsonParam 不是 JSON，

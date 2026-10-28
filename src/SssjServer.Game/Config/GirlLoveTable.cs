@@ -1,4 +1,4 @@
-using SssjServer.Core;
+﻿using SssjServer.Core;
 
 namespace SssjServer.Game.Config;
 
@@ -85,6 +85,13 @@ public sealed class GirlLoveTable
     /// <summary>心情爆炸配置：<c>PlotID</c> → 「(少女 id, 心情增减)」列表（<c>MoodBoom.txt</c>）。</summary>
     private readonly Dictionary<int, List<(uint GirlId, int Change)>> _moodBoom = new();
 
+    public sealed record LinkStory(int Index, List<int[]> Award);
+    private readonly Dictionary<(uint Girl, int Level), LinkStory> _linkStories = new();
+    public LinkStory? LinkStoryOf(uint girl, int level)
+        => _linkStories.GetValueOrDefault((girl, level));
+    public sealed record SecretRow(int Index, int Level, int[] Gift);
+    private readonly Dictionary<uint, List<SecretRow>> _secrets = new();
+    public IEnumerable<SecretRow> SecretsOf(uint girl) => _secrets.GetValueOrDefault(girl) ?? Enumerable.Empty<SecretRow>();
     private GirlLoveTable() { }
 
     /// <summary>空表（配置缺失时的降级形态：等级上限 1、无剧情、无喜爱礼物）。</summary>
@@ -110,7 +117,7 @@ public sealed class GirlLoveTable
     /// <param name="Level">要求的好感度等级。</param>
     /// <param name="Award">奖励元组（<c>G-D-P-L-N</c>）。</param>
     /// <param name="IsMain">true = 主线剧情，false = 支线。</param>
-    public sealed record StoryAward(uint GirlId, int Level, List<int[]> Award, bool IsMain);
+    public sealed record StoryAward(uint GirlId, int Level, List<int[]> Award, bool IsMain, int[]? Condition = null);
 
     /// <summary>某少女是否是联动少女（`GirlConfig.lua:79..82` 的 id 区间）。</summary>
     public static bool IsLinkGirl(uint girlId)
@@ -125,6 +132,16 @@ public sealed class GirlLoveTable
         var t = new GirlLoveTable();
         t.LoadFriendliness(Path.Combine(settingDir, "Friendliness.txt"));
         t.LoadFetter(Path.Combine(settingDir, "Fetter.txt"));
+        var link = SettingTable.LoadAuto(Path.Combine(settingDir, "LinkFetter.txt"), "Level");
+        if (link is not null)
+            foreach (var row in link.Rows)
+            {
+                uint girl = (uint)link.Int(row, "Id");
+                int level = link.Int(row, "Level"), index = link.Int(row, "Index", -1);
+                if (IsLinkGirl(girl) && level > 0 && index >= 0 && index < 32)
+                    t._linkStories[(girl, level)] = new LinkStory(index,
+                        ClubTable.ParseAwardList(link.Str(row, "Award")));
+            }
         t.LoadUnlock(Path.Combine(settingDir, "FriendlinessUnlock.txt"));
         t.LoadSecret(Path.Combine(settingDir, "Secret.txt"));
         t.LoadMoodBoom(Path.Combine(settingDir, "MoodBoom.txt"));
@@ -205,7 +222,8 @@ public sealed class GirlLoveTable
                     continue;
                 int subLevel = table.Int(row, $"SubLevel{j}", level);
                 var subAward = ClubTable.ParseAwardList(table.Str(row, $"SubAward{j}"));
-                _storyAwards[(girlId, subStory)] = new StoryAward(girlId, subLevel, subAward, false);
+                _storyAwards[(girlId, subStory)] = new StoryAward(girlId, subLevel, subAward, false,
+                    ParseFetterItem(table.Str(row, $"SubCond{j}") ?? "").ToArray());
             }
         }
 
@@ -245,6 +263,12 @@ public sealed class GirlLoveTable
             // ★★ `work/girl-story-forensics.md` B.4 把它写成逗号分隔（`Parse2Item`），
             //    按逗号解析会**一条都读不出来**（本轮单测抓到）。
             var fit = ParseDashArray(table.Str(row, "FitItem"));
+            int index = table.Int(row, "SecretId");
+            if (index >= 1 && index <= 20)
+            {
+                if (!_secrets.TryGetValue(girlId, out var secrets)) _secrets[girlId] = secrets = new();
+                secrets.Add(new SecretRow(index, table.Int(row, "FitLove"), fit));
+            }
             if (fit.Length >= 4)
                 _loveGifts.Add((girlId, fit[0], fit[1], fit[2], fit[3]));
         }
@@ -350,11 +374,11 @@ public sealed class GirlLoveTable
     }
 
     /// <summary>
-    /// 该 (girlId, level) 档位是否开放。★ 判据是「<c>FriendlinessUnlock.txt</c> 里有没有这一行」——
-    /// 没有即视为未开放（`UI_GirlLove.lua:178` <c>IsFriendlinessUnlocked</c> 显灰锁）。
+    /// Match UI_GirlLove.IsFriendlinessUnlocked: require an experience row
+    /// without this girl in BanGirl. FriendlinessUnlock is a different reward table.
     /// </summary>
     public bool IsFriendlinessUnlocked(uint girlId, int level)
-        => _unlocked.Contains((girlId, level));
+        => CurveFor(girlId).TryGetValue(level, out var row) && !row.BanGirl.Contains((int)girlId);
 
     /// <summary>是否是该少女的「喜爱礼物」（<c>Secret.txt</c> 的 <c>FitItem</c>）。</summary>
     public bool IsLoveGift(uint girlId, int g, int d, int p, int l)

@@ -1,4 +1,4 @@
-using SssjServer.Core;
+﻿using SssjServer.Core;
 
 namespace SssjServer.Game.Config;
 
@@ -113,6 +113,11 @@ public sealed class HouseItemRow
     /// <c>Template == null</c> 时返回 0（有 nil 保护）。
     /// </summary>
     public int Type { get; init; }
+    public string ThemeType { get; init; } = "";
+    public int OwnMax { get; init; }
+    /// <summary>Parent container grid envelope from InnerSize; absent dimensions do not imply a zero-sized grid.</summary>
+    public IReadOnlyList<uint> InnerSize { get; init; } = [];
+    public IReadOnlyList<uint> Size { get; init; } = [];
 
     /// <summary>
     /// 父容器节点的模板 id（<c>Parent</c> 列，表头中文「父节点(固定物件使用)」）。
@@ -319,6 +324,8 @@ public sealed class HouseTable
     private readonly List<int> _configureSystemTypes = new();
     private int _minNormalItemId;
     private int _outDoorScene;
+    public int CarpetTypeId { get; private set; } = 101;
+    public Dictionary<uint, List<int[]>> Blocks { get; } = new();
 
     private HouseTable() { }
 
@@ -531,6 +538,10 @@ public sealed class HouseTable
                 {
                     Id = id,
                     Type = items.Int(row, "Type", 0),
+                    ThemeType = items.Str(row, "ThemeType"),
+                    OwnMax = items.Int(row, "OwnMax", 0),
+                    InnerSize = ParseUIntList(items.Str(row, "InnerSize")),
+                    Size = ParseUIntList(items.Str(row, "Size")),
                     Parent = (uint)Math.Max(0, items.Int(row, "Parent", 0)),
                     DicPlace = items.Int(row, "DicPlace", 0),
                     DicArea = ParseUIntList(items.Str(row, "DicArea")),
@@ -648,6 +659,22 @@ public sealed class HouseTable
         }
 
         table._configureSystemTypes.AddRange(ExtractIntArray(text, "SystemItems"));
+        int carpet = ExtractInt(text, "CarpetTypeId");
+        if (carpet > 0) table.CarpetTypeId = carpet;
+        var blockSection = System.Text.RegularExpressions.Regex.Match(text,
+            "\"DicBlocks\"\\s*:\\s*\\{(.*?)\\}", System.Text.RegularExpressions.RegexOptions.Singleline);
+        foreach (System.Text.RegularExpressions.Match entry in System.Text.RegularExpressions.Regex.Matches(
+            blockSection.Groups[1].Value, @"(\d+)\s*:\s*\[((?:[^\[\]]|\[[^\[\]]*\])*)\]"))
+        {
+            if (!uint.TryParse(entry.Groups[1].Value, out uint parent)) continue;
+            var blocks = new List<int[]>();
+            foreach (System.Text.RegularExpressions.Match rect in System.Text.RegularExpressions.Regex.Matches(entry.Groups[2].Value, @"\[([^\[\]]*)\]"))
+            {
+                var values = ParseIntList(rect.Groups[1].Value);
+                if (values.Count == 4 && values[0] <= values[2] && values[1] <= values[3]) blocks.Add(values.ToArray());
+            }
+            table.Blocks[parent] = blocks;
+        }
         table._configureDefaultTypes.AddRange(ExtractIntArray(text, "DefaultItems"));
         table._minNormalItemId = ExtractInt(text, "MinNormalItemId");
         table._outDoorScene = ExtractInt(text, "OutDoorScene");

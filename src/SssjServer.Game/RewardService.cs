@@ -1,5 +1,6 @@
 using SssjServer.Core;
 using SssjServer.Game.Config;
+using SssjServer.Game.Handlers;
 
 namespace SssjServer.Game;
 
@@ -25,6 +26,7 @@ public enum RewardSource
     /// 第 6 位不再参与判定。
     /// </summary>
     RandomAward,
+    ThiefDrop,
 
     /// <summary>其它来源（章节累计奖励等）：第 6 位忽略，按 100% 发放、无标签。</summary>
     Extra,
@@ -112,13 +114,17 @@ public sealed class RewardGrantResult
     /// <summary>
     /// 本次发放**顺带改到的任务值**（组合键 → 值），要推一条 pf 1026。
     ///
-    /// ★ 目前唯一来源：皮肤道具（genre 19）入包时把 group 4 的
+    /// ★ 来源包括角色卡/皮肤道具解锁与服装计数同步；皮肤道具入包时把 group 4 的
     /// <c>SuitValue</c> 置 1（已获得未穿过）—— 见
     /// <see cref="RewardService.NoteSuitUnlock"/>。
     /// 不推它的话玩家买到皮肤后**要重登才能在换装界面看到那套衣服**
     /// （列表是按 <c>SuitValue &gt; 0</c> 过滤的，`UI_GirlClothes.lua:847`）。
     /// </summary>
     public IReadOnlyList<KeyValuePair<uint, int>> ChangedTasks => _tasks;
+
+    private readonly HashSet<uint> _riki = new();
+    public IReadOnlyCollection<uint> ChangedRiki => _riki;
+    internal void NoteRiki(uint id) => _riki.Add(id);
 
     /// <summary>客户端要的 <c>tbAwards</c>：数组的数组。</summary>
     public int[][] ToAwardTuples()
@@ -137,6 +143,15 @@ public sealed class RewardGrantResult
                 $"{r.Name}x{r.Count}{(r.IsMoney ? $"→货币{r.MoneyId}" : $"#{r.ItemGuid}")}[flag{r.Flag}]"));
 
     internal void AddReward(GrantedReward reward) => _rewards.Add(reward);
+
+    private readonly List<Girl> _girls = new();
+    public IReadOnlyList<Girl> ChangedGirls => _girls;
+    internal void NoteGirl(Girl girl)
+    {
+        int index = _girls.FindIndex(g => g.Girlid == girl.Girlid);
+        if (index >= 0) _girls[index] = girl;
+        else _girls.Add(girl);
+    }
 
     internal void NoteTask(uint composedKey, int value)
     {
@@ -157,6 +172,20 @@ public sealed class RewardGrantResult
     {
         if (!_items.Contains(item))
             _items.Add(item);
+    }
+
+    private readonly List<HouseFurniture> _furniture = [];
+    internal IReadOnlyList<HouseFurniture> ChangedFurniture => _furniture;
+    internal void NoteFurniture(HouseFurniture item) => _furniture.Add(item);
+
+    internal void Absorb(RewardGrantResult other)
+    {
+        _rewards.AddRange(other.Rewards);
+        foreach (int id in other.ChangedMoney) NoteMoney(id);
+        foreach (var item in other.ChangedItems) NoteItem(item);
+        foreach (var girl in other.ChangedGirls) NoteGirl(girl);
+        foreach (var task in other.ChangedTasks) NoteTask(task.Key, task.Value);
+        _furniture.AddRange(other.ChangedFurniture);
     }
 }
 
@@ -279,6 +308,29 @@ public sealed class RewardService
     /// 与 <see cref="Boxes"/> 是同一条链上的两环，缺任何一环都表现为「钱花了、什么都没得到」。
     /// </summary>
     public GirlDressTable? Suits { get; set; }
+    public CharacterCardTable? CharacterCards { get; set; }
+    public RikiCardTable? RikiCards { get; set; }
+    public MissionTable? Missions { get; set; }
+    public HouseTable? Furniture { get; set; }
+
+    internal bool IsCafeFurniture(uint g, uint d, uint p, uint l)
+        => _templates.Get(g, d, p, l)?.ClassName == "CafeItemAuto";
+
+    // Purchase limits are checked before charging. Scripted rewards use the same
+    // conversion but do not invent a purchase-limit rule for non-shop sources.
+    internal bool CanReceiveFurniture(Player player, uint g, uint d, uint p, uint l, int count,
+        bool purchaseLimits = true)
+    {
+        if (!IsCafeFurniture(g, d, p, l)) return true;
+        var template = _templates.Get(g, d, p, l)!;
+        if (Furniture is null || !int.TryParse(template.ExtParam1, out int id)
+            || !Furniture.Items.TryGetValue(id, out var row) || row.IsSystem
+            || Furniture.IsPoolBlockedTemplate(id) || count <= 0) return false;
+        var state = HouseFeature.ReadOrCreate(player, Furniture);
+        if ((ulong)state.NextObjId + (uint)count > uint.MaxValue) return false;
+        return !purchaseLimits || (long)state.Furniture.Count + count <= 2000
+            && (long)state.Furniture.Count(f => f.TemplateId == id) + count <= row.OwnMax;
+    }
 
     /// <param name="templates">物品模板表（判定「是不是货币」）。缺表时传 <see cref="ItemBaseTable.Empty"/> 也能跑。</param>
     /// <param name="rng">随机源。单测传固定种子可完全确定化。</param>
@@ -450,6 +502,31 @@ public sealed class RewardService
     {
         string name = _templates.NameOf(g, d, p, l);
 
+        if (IsCafeFurniture(g, d, p, l))
+        {
+            if (!CanReceiveFurniture(player, g, d, p, l, count, purchaseLimits: false))
+            {
+                Log.Warn($"[reward] Invalid CafeItemAuto {g}-{d}-{p}-{l}; not granted");
+                return;
+            }
+            int id = int.Parse(_templates.Get(g, d, p, l)!.ExtParam1);
+            var state = HouseFeature.ReadOrCreate(player, Furniture!);
+            var items = state.Furniture.ToList();
+            uint next = state.NextObjId;
+            for (int n = 0; n < count; n++)
+            {
+                // Room=0 is storage. A purchase must never activate a layout or
+                // add objects with parent=0 to an active scene room.
+                var item = new HouseFurniture(next++, id, 0, 0, 0, 0, 0,
+                    Furniture!.Items[id].BizPointCount, 0);
+                items.Add(item);
+                result.NoteFurniture(item);
+            }
+            HouseFeature.WriteState(player, new HouseState { Furniture = items, NextObjId = next });
+            result.AddReward(new GrantedReward(g, d, p, l, (uint)count, flag, 0, 0, name));
+            return;
+        }
+
         // ⓪ ★★★ 礼包箱（ClassName = IBGiftAuto）：**就地展开**成箱内的 Fix 物品，
         //    礼包本体不进背包。不展开的后果见 ItemBoxTable 类注释 §0
         //    （十面妆造买皮肤只拿到一个用不掉的礼包道具、换装界面里皮肤仍是锁的）。
@@ -460,6 +537,8 @@ public sealed class RewardService
         if (_templates.TryGetMoneyId(g, d, p, l, out int moneyId))
         {
             player.AddMoney(moneyId, count);
+            if (g == 15 && d == 127 && p == 1 && l == 1 && Missions is not null)
+                Tower21Missions.TokensGained(player, Missions, count, result);
             result.NoteMoney(moneyId);
             result.AddReward(new GrantedReward(g, d, p, l, (uint)count, flag, moneyId, 0, name));
             return;
@@ -484,7 +563,27 @@ public sealed class RewardService
             }
 
             if (g == GenreCard)
+            {
+                if (CharacterCards is not null && Handlers.CardCollection.MarkOwned(player, CharacterCards, g, d, p, l) is { } owned)
+                    result.NoteTask(owned.Key, owned.Value);
+                if (CharacterCards?.Get(g, d, p, l) is not null && RikiCards is not null)
+                    foreach (uint id in RikiCards.MarkOwned(player, g, d, p, l))
+                    {
+                        result.NoteRiki(id);
+                        result.NoteTask(Player.ComposeTaskId(53, (int)id), 1);
+                    }
+                var before = player.GetGirl(d);
+                uint oldLevel = before?.Level ?? 0;
                 EnsureGirl(player, d, cardLevel);
+                var girl = player.GetGirl(d)!;
+                var card = CharacterCards?.Get(g, d, p, l);
+                if (before is null && card is not null && card.ModelId > 0)
+                    girl.Modelid = (uint)card.ModelId;
+                if (before is null || oldLevel != girl.Level) result.NoteGirl(girl);
+                if (Suits is not null && CharacterCards is not null)
+                    foreach (var change in Handlers.GirlDressFeature.SyncRewardSuits(Suits, CharacterCards, player, d))
+                        result.NoteTask(change.Key, change.Value);
+            }
 
             // 展示上仍是「一种奖励 x N」，与客户端 txtNum.text = tbAward[5] 的用法一致
             result.AddReward(new GrantedReward(g, d, p, l, (uint)instances, flag, 0, lastGuid, name));
@@ -533,6 +632,13 @@ public sealed class RewardService
         {
             Log.Warn($"[reward] 皮肤 {suit} 对应的少女 {suit.GirlId} 未持有 ⇒ 暂不解锁服饰"
                    + "（拿到少女后登录时会由 GirlDressFeature.SyncOwnedSuits 补上）");
+            return;
+        }
+
+        if (CharacterCards is not null)
+        {
+            foreach (var change in Handlers.GirlDressFeature.SyncRewardSuits(suits, CharacterCards, player, suit.GirlId))
+                result.NoteTask(change.Key, change.Value);
             return;
         }
 
@@ -632,6 +738,7 @@ public sealed class RewardService
     {
         RewardSource.FirstAward => FlagFirstClear,
         RewardSource.RandomAward => FlagRandom,
+        RewardSource.ThiefDrop => 10,
         _ => FlagNone,
     };
 }

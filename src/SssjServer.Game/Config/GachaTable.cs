@@ -146,6 +146,8 @@ public sealed class GachaPool
     /// <c>MoneyLogic:GetInfo(self.tbCurrent.nCash)</c>）。
     /// </summary>
     public int CashType { get; init; }
+    public int ExchangeRate { get; init; }
+    public bool CanUseFreeDiamond { get; init; } = true;
 
     /// <summary>单抽消耗的道具四元组（<c>CashType</c> 0/1 时有效）。</summary>
     public int[]? CostOneItem { get; init; }
@@ -166,6 +168,7 @@ public sealed class GachaPool
     /// <c>if self.tbCurrent.JudgeType ~= 2 then</c>）。
     /// </summary>
     public int JudgeType { get; init; }
+    public int SetUpNum { get; init; }
 
     /// <summary>1 隐藏十连 / 2 隐藏单抽（<c>HideTenBtn</c>）。</summary>
     public int HideTenBtn { get; init; }
@@ -181,6 +184,15 @@ public sealed class GachaPool
 
     /// <summary>UP 自选箱物品（<c>UpBox</c> 列，四元组+N）。</summary>
     public int[]? UpBox { get; init; }
+    public int[]? GetItem { get; init; }
+    public int FreeType { get; init; }
+    public int FreeCount { get; init; }
+    public long FreeStart { get; init; }
+    public long FreeEnd { get; init; }
+
+    public bool FreeAvailableAt(long now, int used) => FreeType is 1 or 2 && FreeCount > 0
+        && used >= 0 && used < FreeCount
+        && !(FreeStart > 0 && FreeEnd > 0 && (now < FreeStart || now > FreeEnd));
 
     /// <summary>用哪一行 <c>CardStarSeed.txt</c>（<c>CardStarSeed</c> 列）。</summary>
     public int CardStarSeedId { get; init; }
@@ -325,6 +337,7 @@ public sealed class GachaTable
     /// <summary>池 id → 该池的**全部档期**（顺序即文件顺序）。</summary>
     private readonly Dictionary<int, List<GachaPool>> _pools = new();
     private readonly Dictionary<int, CardStarSeedRow> _seeds = new();
+    private GachaRotation? _rotation;
 
     private GachaTable() { }
 
@@ -347,6 +360,9 @@ public sealed class GachaTable
     /// </summary>
     public GachaPool? Get(int id, long now)
     {
+        int? selected = _rotation?.SegmentAt(1, id, now);
+        if (selected.HasValue)
+            return selected > 0 ? Segments(id).ElementAtOrDefault(selected.Value - 1) : null;
         foreach (var seg in Segments(id))
         {
             if (seg.IsOpenAt(now))
@@ -374,7 +390,7 @@ public sealed class GachaTable
     /// <summary>从 setting 目录加载。缺表返回空表并打 WARN（不抛）。</summary>
     public static GachaTable Load(string settingDir)
     {
-        var table = new GachaTable();
+        var table = new GachaTable { _rotation = GachaRotation.For(settingDir) };
 
         // ---- CardStarSeed.txt ----
         var seedRaw = SettingTable.Load(Path.Combine(settingDir, SeedFileName));
@@ -425,16 +441,24 @@ public sealed class GachaTable
                 Name = raw.Str(row, "Name"),
                 PoolFile = raw.Str(row, "Pool"),
                 CashType = cash,
+                ExchangeRate = raw.Int(row, "ExchangeRate"),
+                CanUseFreeDiamond = raw.Int(row, "CanUseFreeDiamond", 1) != 0,
                 CostOneItem = cash is 0 or 1 ? ParseItem(raw.Str(row, "CostOne")) : null,
                 CostTenItem = cash is 0 or 1 ? ParseItem(raw.Str(row, "CostTen")) : null,
                 CostOneMoney = cash is 0 or 1 ? 0 : raw.Int(row, "CostOne"),
                 CostTenMoney = cash is 0 or 1 ? 0 : raw.Int(row, "CostTen"),
                 JudgeType = raw.Int(row, "JudgeType"),
+                SetUpNum = raw.Int(row, "SetUpNum"),
                 HideTenBtn = raw.Int(row, "HideTenBtn"),
                 ProtectNum = raw.Int(row, "ProtectNum"),
                 ProtectUpNum = raw.Int(row, "ProtectUpNum"),
                 UpBoxNum = raw.Int(row, "UpBoxNum"),
                 UpBox = ParseItem(raw.Str(row, "UpBox")),
+                GetItem = ParseItem(raw.Str(row, "GetItem")),
+                FreeType = raw.Int(row, "FreeType"),
+                FreeCount = raw.Int(row, "FreeCount"),
+                FreeStart = ParseTimeRange(raw.Str(row, "FreeTime")).Start,
+                FreeEnd = ParseTimeRange(raw.Str(row, "FreeTime")).End,
                 CardStarSeedId = raw.Int(row, "CardStarSeed"),
                 RotateVersion = raw.Int(row, "RotateVersion"),
                 StartTime = start,

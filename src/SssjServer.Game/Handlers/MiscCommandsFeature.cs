@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+﻿using System.Text.Json.Nodes;
 using SssjServer.Core;
 
 namespace SssjServer.Game.Handlers;
@@ -37,20 +37,13 @@ public sealed class MiscCommandsFeature : IGameFeature
     /// <summary>存档键（<c>Player.Extra</c>）：推送开关。</summary>
     public const string PushExtraKey = "pushenable";
 
-    /// <summary>少女体力的任务值 group（与少女属性同 group 3，见 AGENTS.md §3 那条）。</summary>
+    // Legacy constants retained for old-save diagnostics only. Recovery now uses
+    // the client's group 41 girl-id clocks; offset 17 is no longer written.
     public const int GirlVarGroup = 3;
-
-    /// <summary>
-    /// 少女体力在 group 3 里的偏移。
-    /// ★ 未在客户端取证到确切偏移（<c>GirlCommon.lua</c> 的偏移表里只有
-    /// <c>TrainPos=11 / TrainTime=12 / SuitCount=13 / TrainOutId=16</c>），
-    /// 这里用一个**不与已知偏移冲突**的槽位存服务端侧的体力值，
-    /// 仅用于「跨会话保留」——客户端的体力表现由它自己的
-    /// <c>GirlVigourManager</c> 本地计算（见 <see cref="OnCafeGirlVigor"/> 的说明）。
-    /// </summary>
     public const int GirlVigorOffset = 17;
 
     private GameFeatureContext _ctx = null!;
+    private GirlMoodRecovery _mood = null!;
 
     public string Name => "杂项常驻（LuaCall 171 随机事件完成 / 240 少女体力 / 353 推送开关）";
 
@@ -63,6 +56,11 @@ public sealed class MiscCommandsFeature : IGameFeature
     public void Install(GameFeatureContext ctx)
     {
         _ctx = ctx;
+        _mood = new GirlMoodRecovery(Path.GetFullPath(ctx.Options.SettingDirectory));
+        ctx.OnPlayerPrepare((session, player) =>
+        {
+            if (_mood.Refresh(null, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds())) ctx.Store.Save(player);
+        });
         ctx.MapLuaCall(CmdEventComplete, OnEventComplete);
         ctx.MapLuaCall(CmdCafeGirlVigor, OnCafeGirlVigor);
         ctx.MapLuaCall(CmdSetPushEnable, OnSetPushEnable);
@@ -120,9 +118,7 @@ public sealed class MiscCommandsFeature : IGameFeature
     /// ⇒ 服务端**只落库、不回包**。回了也没人处理（客户端 else 分支什么都不做）。
     /// ★ 注意 <c>MODULE_SERVER</c> 分支也**没有 <c>CallClient</c>** —— 原服同样不回。
     ///
-    /// <para><b>体力值由谁算</b></para>
-    /// 客户端 <c>GirlVigourManager</c> 自己按舒适度/时间推算并**主动上报**变化的少女 id，
-    /// 服务端只需把「这些少女的体力发生了变化」记下来（跨会话保留）。
+    /// 客户端只检测是否到时并上报id，服务端计算恢复并推少女/任务值。
     /// </summary>
     internal Task OnCafeGirlVigor(ClientSession session, int cmd, JsonNode? param)
     {
@@ -137,15 +133,11 @@ public sealed class MiscCommandsFeature : IGameFeature
             return Task.CompletedTask;
         }
 
-        // 记一次「体力被刷新」的时间戳，供跨会话参考；不改客户端的表现
-        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        foreach (int gid in ids)
-            player.SetTask(GirlVarGroup, GmUnlock.GirlTaskId((uint)gid, GirlVigorOffset), (int)(now & 0x7FFFFFFF));
-        _ctx.Store.Save(player);
-
-        Log.Info($"[session {session.Id}] CafeGirlVigor(240) 少女体力同步：{ids.Count} 位" +
-                 $"（{string.Join(",", ids)}）已记时间戳；★ 按原厂约定**不回包**" +
-                 "（客户端 else 分支是空的，体力由 GirlVigourManager 本地推算）");
+        // The client reports IDs only; authoritative recovery changes Moodvalue
+        // and pushes normal girl/task updates. There is no LuaCall 240 reply.
+        if (ids.Any(id => player.GetGirl((uint)id) is not null)
+            && _mood.Refresh(session, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
+            _ctx.Store.Save(player);
         return Task.CompletedTask;
     }
 

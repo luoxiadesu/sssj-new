@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+﻿using System.Text.Json.Nodes;
 using SssjServer.Core;
 using SssjServer.Game.Config;
 
@@ -180,8 +180,9 @@ public sealed class WeaponFeature : IGameFeature
     /// ★ <c>tbGuid</c> 的每项是**二元位置数组**，不是对象。
     ///
     /// 经验公式（1:1 照 `WeaponCommon.lua:454..455`）：每把素材提供
-    /// <c>RarityExp(素材稀有度) + SumExpBelow(素材等级)</c>
-    /// —— 即「基础喂料值 + 它自己已投入的经验」。
+    /// <c>RarityExp + floor(min(SumExpBelow * 0.3, 150000))</c>。
+    /// 强化液（7-3）按 ItemList.ExtParam1/2 提供经验及金币消耗，支持堆叠数量。
+    /// 所有素材与金币预先校验，失败时不改存档。
     /// 升级推演走 <see cref="WeaponTable.DestLevel"/>（保留余额、撞上限仍累加）。
     /// </summary>
     private Task OnStrong(ClientSession session, Player player, JsonObject? param)
@@ -203,61 +204,105 @@ public sealed class WeaponFeature : IGameFeature
             return Task.CompletedTask;
         }
 
-        var mats = ReadGuidCountList(param?["tbGuid"]);
-        if (mats.Count == 0)
+        // The client sends [guid, count] pairs. Reject malformed entries as a
+        // whole: the shared permissive reader otherwise silently drops them.
+        if (param?["tbGuid"] is not JsonArray raw || raw.Count == 0 || raw.Any(el =>
+                el is not JsonArray row || row.Count != 2 ||
+                !uint.TryParse(row[0]?.ToString(), out uint id) || id == 0 ||
+                !int.TryParse(row[1]?.ToString(), out int n) || n <= 0))
         {
             Fail(session, CmdStrong, ErrGeneric);
-            Log.Warn($"[session {session.Id}] WeaponLogicMsg 强化：素材列表为空");
             return Task.CompletedTask;
         }
-
+        var mats = ReadGuidCountList(raw);
         int maxLevel = _weapons.MaxLevel(tpl.Rarity, (int)target.BreakLevel);
-        int addExp = 0;
-        var consumed = new List<Item>();
+        long addExp = 0;
+        long gold = 0;
+        var consumed = new List<(Item Item, uint Count)>();
+        var seen = new HashSet<uint>();
 
-        foreach (var (matGuid, _) in mats)
+        foreach (var (matGuid, count) in mats)
         {
-            if (matGuid == guid)
-                continue;                       // 不能拿自己当素材
-            var mat = FindWeapon(player, matGuid);
-            if (mat is null)
-                continue;
-            if (mat.LockOn != 0)
-                continue;                       // 上锁的不吃
-            var matTpl = _weapons.Find(mat.Detail, mat.Particular, mat.Level);
-            if (matTpl is null)
-                continue;
+            var mat = player.Items.FirstOrDefault(i => i.Guid == matGuid);
+            if (matGuid == guid || !seen.Add(matGuid) || mat is null ||
+                mat.LockOn != 0 || mat.Count < count)
+            {
+                Fail(session, CmdStrong, ErrGeneric);
+                return Task.CompletedTask;
+            }
 
-            addExp += _weapons.RarityExp(matTpl.Rarity)
-                      + _weapons.SumExpBelow((int)mat.EnhanceLevel);
-            consumed.Add(mat);
+            if (mat.Genre == 7 && mat.Detail == 3)
+            {
+                var material = _ctx.ItemTemplates.Get(mat.Genre, mat.Detail, mat.Particular, mat.Level);
+                if (material is null || !int.TryParse(material.ExtParam1, out int exp) || exp <= 0 ||
+                    !int.TryParse(material.ExtParam2, out int cost) || cost < 0)
+                {
+                    Fail(session, CmdStrong, ErrGeneric);
+                    return Task.CompletedTask;
+                }
+                // UI_Updatebox: experience = ExtParam1, gold = ExtParam2, per unit.
+                addExp += (long)exp * count;
+                gold += (long)cost * count;
+            }
+            else if (mat.Genre == WeaponTable.WeaponGenre && count == 1)
+            {
+                var matTpl = _weapons.Find(mat.Detail, mat.Particular, mat.Level);
+                if (matTpl is null || mat.OwnGuid != 0 ||
+                    player.Formations.Any(f => f.Slots.Any(slot => slot.WeaponGuid == matGuid)))
+                {
+                    Fail(session, CmdStrong, ErrGeneric);
+                    return Task.CompletedTask;
+                }
+                // WeaponCommon:GetWeaponGiveExp/GetWeaponGiveGold, used by manual selection.
+                addExp += _weapons.RarityExp(matTpl.Rarity) +
+                    (long)Math.Floor(Math.Min(_weapons.SumExpBelow((int)mat.EnhanceLevel) * 0.3, 150000));
+                gold += _weapons.RarityExp(matTpl.Rarity);
+            }
+            else
+            {
+                Fail(session, CmdStrong, ErrGeneric);
+                return Task.CompletedTask;
+            }
+            consumed.Add((mat, (uint)count));
         }
 
-        if (consumed.Count == 0)
+        if (addExp <= 0 || addExp > int.MaxValue - (long)target.EnhanceExp ||
+            gold > int.MaxValue || player.GetMoney(GoldMoneyId) < gold)
         {
             Fail(session, CmdStrong, ErrGeneric);
-            Log.Warn($"[session {session.Id}] WeaponLogicMsg 强化：{mats.Count} 个素材一个都不可用");
             return Task.CompletedTask;
         }
 
         int oldLevel = (int)target.EnhanceLevel;
         int oldExp = (int)target.EnhanceExp;
-        var (newLevel, newExp) = _weapons.DestLevel(oldLevel, oldExp, addExp, maxLevel);
+        var (newLevel, newExp) = _weapons.DestLevel(oldLevel, oldExp, (int)addExp, maxLevel);
 
         target.EnhanceLevel = (uint)newLevel;
         target.EnhanceExp = (uint)newExp;
-        foreach (var mat in consumed)
-            player.Items.Remove(mat);
-
+        var removed = new List<Item>();
+        var changed = new List<Item> { target };
+        foreach (var (mat, count) in consumed)
+        {
+            mat.Count -= count;
+            if (mat.Count == 0)
+            {
+                player.Items.Remove(mat);
+                removed.Add(mat);
+            }
+            else
+                changed.Add(mat);
+        }
+        player.AddMoney(GoldMoneyId, -(int)gold);
         _ctx.Store.Save(player);
 
-        // ★ 先推数据、再回包（客户端回调不收数据，见类注释 §2）
-        GameNotify.PushItemsRemoved(session, consumed);
-        GameNotify.PushItem(session, target);
+        GameNotify.PushItemsRemoved(session, removed);
+        GameNotify.PushItems(session, changed);
+        if (gold > 0)
+            GameNotify.PushMoney(session, player, GoldMoneyId);
         Ok(session, CmdStrong);
 
         Log.Info($"[session {session.Id}] WeaponLogicMsg 强化 {Describe(target)}：" +
-                 $"吃掉 {consumed.Count} 把素材（+{addExp} 经验）→ " +
+                 $"吃掉 {consumed.Count} 把素材（+{addExp} 经验、消耗 {gold} 晶币）→ " +
                  $"LV{oldLevel}({oldExp}) → LV{newLevel}({newExp})，上限 {maxLevel}");
         return Task.CompletedTask;
     }
@@ -407,6 +452,42 @@ public sealed class WeaponFeature : IGameFeature
             return Task.CompletedTask;
         }
 
+        // WeaponBreak.BreakItem is a required COUNT, not an item template id.
+        // UI_Updatebox allows identical weapons or WeaponCommon's universal weapon.
+        if (param?["tbGuid"] is not JsonArray raw || raw.Count == 0 || raw.Any(el =>
+                el is not JsonArray row || row.Count != 2 ||
+                !uint.TryParse(row[0]?.ToString(), out uint id) || id == 0 ||
+                !int.TryParse(row[1]?.ToString(), out int n) || n != 1))
+        {
+            Fail(session, CmdBreak, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        var materials = ReadGuidCountList(raw);
+        var removed = new List<Item>();
+        var seen = new HashSet<uint>();
+        foreach (var (materialGuid, _) in materials)
+        {
+            var material = FindWeapon(player, materialGuid);
+            bool same = material is not null && material.Detail == target.Detail &&
+                material.Particular == target.Particular && material.Level == target.Level;
+            bool universal = material is not null && material.Detail == 2 && material.Level == 1 &&
+                material.Particular == (tpl.Rarity > 3 ? 10000u : 10001u);
+            if (material is null || materialGuid == guid || !seen.Add(materialGuid) ||
+                material.Count != 1 || material.LockOn != 0 || material.OwnGuid != 0 ||
+                (!same && !universal) ||
+                player.Formations.Any(f => f.Slots.Any(slot => slot.WeaponGuid == materialGuid)))
+            {
+                Fail(session, CmdBreak, ErrGeneric);
+                return Task.CompletedTask;
+            }
+            removed.Add(material);
+        }
+        if (removed.Count != cost.BreakItem || cost.BreakItem <= 0)
+        {
+            Fail(session, CmdBreak, ErrGeneric);
+            return Task.CompletedTask;
+        }
+
         if (cost.CurrencyCount > 0)
         {
             long have = player.GetMoney(cost.CurrencyId);
@@ -420,12 +501,15 @@ public sealed class WeaponFeature : IGameFeature
             player.AddMoney(cost.CurrencyId, -cost.CurrencyCount);
         }
 
+        foreach (var material in removed)
+            player.Items.Remove(material);
         target.BreakLevel = (uint)(breakLevel + 1);
         int newMax = _weapons.MaxLevel(tpl.Rarity, breakLevel + 1);
         _ctx.Store.Save(player);
 
         if (cost.CurrencyCount > 0)
             GameNotify.PushMoney(session, player, cost.CurrencyId);
+        GameNotify.PushItemsRemoved(session, removed);
         GameNotify.PushItem(session, target);
         Ok(session, CmdBreak);
 

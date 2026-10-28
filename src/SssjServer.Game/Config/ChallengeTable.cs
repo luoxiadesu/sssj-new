@@ -157,6 +157,23 @@ public sealed class ChallengeTable
         => FirstEndTime <= 0 ? 0 : FirstEndTime + (weekIndex - 1) * OneWeek;
 
     /// <summary>
+    /// Actual calendar cycle, separate from the last available content row.
+    /// Beyond the archive, replay its final content while retaining weekly isolation.
+    /// The regional schedule is UTC+8; the old FirstBeginTime value used UTC date
+    /// parsing, so normalize that historical value here without rewriting content IDs.
+    /// </summary>
+    internal ChallengeCycle CycleAt(long now)
+    {
+        long first = FirstBeginTime - 8 * 3600L;
+        if (FirstBeginTime <= 0 || _weeks.Count == 0 || now < first) return new(0, 0, 0, 0, 0, false);
+        int cycle = checked((int)((now - first) / OneWeek + 1));
+        long begin = first + (cycle - 1L) * OneWeek;
+        long end = begin + FirstEndTime - FirstBeginTime;
+        int content = Math.Clamp(cycle, _weeks.Min(w => w.WeekIndex), _weeks.Max(w => w.WeekIndex));
+        return new(cycle, content, begin, end, begin + OneWeek, cycle > _weeks.Max(w => w.WeekIndex));
+    }
+
+    /// <summary>
     /// 按「总积分」算出可领取的奖励档位（<c>Goal ≤ 总分</c> 且 <c>Goal &gt; 已领档位</c>）。
     /// 逐字对应 <c>UI_TowerScoreInfo.lua:137..150</c> 的 <c>GetMark == 1</c> 判定。
     /// </summary>
@@ -267,4 +284,9 @@ public sealed class ChallengeTable
             return 0;
         }
     }
+}
+
+internal sealed record ChallengeCycle(int Cycle, int Content, long Begin, long End, long Clear, bool Replay)
+{
+    internal bool IsOpen(long now) => Cycle > 0 && now >= Begin && now < End;
 }

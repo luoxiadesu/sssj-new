@@ -105,7 +105,7 @@ namespace SssjServer.Game.Handlers;
 /// 这与邮件域「必须构造完整 CMailInfo」完全不同。
 ///
 /// </summary>
-public sealed class PhoneMsgFeature : IGameFeature
+public sealed class PhoneMsgFeature : IGameFeature, IGamePulseFeature
 {
     /// <summary>上行 sFunction（客户端 → 服务端）。</summary>
     public const string UpFunction = "PhoneMsg";
@@ -174,6 +174,7 @@ public sealed class PhoneMsgFeature : IGameFeature
 
     private GameFeatureContext _ctx = null!;
     private PhoneMsgTable _table = PhoneMsgTable.Empty;
+    private CartoonTable _cartoons = null!;
 
     /// <summary>
     /// 好感度曲线（私信/回帖领奖要加少女经验）。★ 本域自己 Load 一份而不是
@@ -192,6 +193,7 @@ public sealed class PhoneMsgFeature : IGameFeature
         _ctx = ctx;
         string dir = Path.GetFullPath(ctx.Options.SettingDirectory);
         _table = PhoneMsgTable.Load(dir);
+        _cartoons = CartoonTable.Load(dir);
         _girlLove = GirlLoveTable.Load(dir);
         _chapters = ChapterTable.Load(dir);
         ctx.MapFunction(UpFunction, OnPhoneMsg);
@@ -238,38 +240,10 @@ public sealed class PhoneMsgFeature : IGameFeature
         {
             foreach (var topic in letter.Topics.Values)
             {
-                // 只要有一个元素是「位置 0、分支非 0」就需要重算
-                bool dirty = topic.MsgIds.Any(v => v > 0 && v < PhoneMsgTable.ReplyIdBase);
-                if (!dirty)
-                    continue;
-
                 var cfg = _table.Letter(topic.TopicId);
-                if (cfg is null || cfg.Lines.Count == 0)
-                    continue;   // 配置缺失就别乱改，保留原样
-
-                var rebuilt = new List<int>(topic.MsgIds.Count);
-                int curPos = 1;
-                foreach (int old in topic.MsgIds)
-                {
-                    if (old == 0)
-                    {
-                        rebuilt.Add(0);          // 「NPC 稍后回复」原样保留
-                        continue;
-                    }
-
-                    // 老值可能已经是合法编码（混合存档），那就沿用它的分支号
-                    int branch = old < PhoneMsgTable.ReplyIdBase
-                        ? old
-                        : PhoneMsgTable.ReplyBranchOf(old);
-
-                    int next = PhoneMsgTable.NextReplyPos(cfg, curPos, branch);
-                    if (next <= 0)
-                        next = curPos;
-                    rebuilt.Add(PhoneMsgTable.EncodeReplyId(next, branch));
-                    curPos = next;
-                    fixedItems++;
-                }
-
+                if (cfg is null || !PhoneDialog.TryRepairLegacy(cfg, topic, out var rebuilt))
+                    continue;
+                fixedItems += rebuilt.Count;
                 topic.MsgIds.Clear();
                 topic.MsgIds.AddRange(rebuilt);
                 fixedTopics++;
@@ -281,7 +255,7 @@ public sealed class PhoneMsgFeature : IGameFeature
 
         SaveState(player, state);
         Log.Info($"[session {session.Id}] 私信存量修复：{fixedTopics} 个话题、{fixedItems} 条回复" +
-                 "的 replyId 由「裸候选序号（位置恒 0）」重算为「位置*10+分支」" +
+                 "的历史 replyId 已按玩家回复路径重算为「位置*10+分支」" +
                  "—— 修复前这些话题在客户端永远无法推进");
     }
 
@@ -291,6 +265,53 @@ public sealed class PhoneMsgFeature : IGameFeature
     /// （这一族没有 sCmd/tbParam 外壳，见 <c>LuaCallRouter.ScriptCallHandler</c> 注释）。
     /// </summary>
     private Task OnPhoneMsg(ClientSession session, string function, JsonNode? param)
+    {
+        if (session.Tag is Player player)
+        {
+            lock (player) return HandlePhoneMsgLocked(session, function, param);
+        }
+        return Task.CompletedTask;
+    }
+
+    void IGamePulseFeature.OnPlayerPulse(ClientSession session, Player player)
+    {
+        lock (player)
+        {
+            var initial = LoadState(player);
+            var beforeBbs = initial.Bbs.Keys.ToHashSet();
+            var before = initial.Letters.Values
+                .SelectMany(letter => letter.Topics.Keys).ToHashSet();
+            if (!BackfillTriggers(session, player)) return;
+            var current = LoadState(player);
+            // The existing nCmd=3 path rebuilds Lua UI data and refreshes unread
+            // indicators. Send only newly delivered topics, then restore the native
+            // cache from the authoritative snapshot (AddLetterReplyInfo mutates it).
+            foreach (var letter in current.Letters.Values.OrderBy(l => l.NpcId))
+                foreach (int topicId in letter.Topics.Keys.Where(id => !before.Contains(id)).Order())
+                    Reply(session, CmdLetter, new JsonObject
+                    {
+                        ["nNpcId"] = letter.NpcId,
+                        ["nMsgId"] = topicId,
+                        ["nSelectId"] = 0,
+                    });
+            foreach (var post in current.Bbs.Values.Where(b => !beforeBbs.Contains(b.TopicId)).OrderBy(b => b.TopicId))
+            {
+                var config = _table.Bbs(post.TopicId)!;
+                if (config.NpcId == 0)
+                    Reply(session, CmdBbsNewApply, new JsonObject { ["nMsgId"] = post.TopicId });
+                else
+                    Reply(session, CmdBbs, new JsonObject
+                    {
+                        ["nNpcId"] = config.NpcId,
+                        ["nMsgId"] = post.TopicId,
+                        ["nSelectId"] = 0,
+                    });
+            }
+            PushAll(session, player);
+        }
+    }
+
+    private Task HandlePhoneMsgLocked(ClientSession session, string function, JsonNode? param)
     {
         if (session.Tag is not Player player)
         {
@@ -342,9 +363,7 @@ public sealed class PhoneMsgFeature : IGameFeature
     /// ★★ **全量覆盖语义**：客户端 <c>PhoneMsgData</c> 先 <c>Clear()</c> 两个字典再重填
     /// ⇒ 空列表也要推（能把上次登录的残留清干净），且每次状态变更都要重推。
     ///
-    /// ★ <c>petlist</c>/<c>cardgacha</c>/<c>weapongacha</c> 三个字段**有意留空**：
-    /// 宠物由咖啡馆域管；两个 gacha 是抽卡历史（`UI_GachaHistory.lua` 读它），
-    /// 属独立特性，本轮不做 —— 留空不会让客户端报错（repeated 字段允许空）。
+    /// 宠物仍由咖啡馆域管理；角色与武器补给历史随每次全量同步一起发送，避免覆盖为空。
     /// </summary>
     internal void PushAll(ClientSession session, Player player)
     {
@@ -365,7 +384,7 @@ public sealed class PhoneMsgFeature : IGameFeature
                 var ti = new TopicInfo
                 {
                     Topicid = (uint)topic.TopicId,
-                    Awardflag = (uint)topic.AwardFlag,
+                    Awardflag = (uint)(state.ClaimedLetters.Contains(topic.TopicId) ? 1 : topic.AwardFlag),
                 };
                 foreach (int m in topic.MsgIds)
                     ti.Msgid.Add((uint)m);
@@ -386,6 +405,7 @@ public sealed class PhoneMsgFeature : IGameFeature
             });
         }
 
+        GachaHistory.Fill(ntf, player);
         session.Push(GamePf.PhoneMsgNtf, ntf);
         Log.Info($"[session {session.Id}] pf 1035 下发终端数据：私信 {ntf.Letterlist.Count} 条" +
                  $"（话题 {ntf.Letterlist.Sum(l => l.Msginfo.Count)} 个）、帖子 {ntf.Bbsinfolist.Count} 条");
@@ -419,13 +439,17 @@ public sealed class PhoneMsgFeature : IGameFeature
     /// ★★ 这个 bug 骗过了全部四条常规判据：服务端日志「回复成功」、零 unhandled、
     /// 客户端零 Lua 报错、存档也记了一笔。**只有真机点进界面看对话有没有推进才能发现。**
     ///
-    /// ★ <c>nSelectId == 0</c> 在客户端是「NPC 稍后回复」分支
-    /// （`PhoneMsgLogic.lua:1313` 起了个 5~10 秒随机定时器）—— 保持原样透传。
+    /// ★ <c>nSelectId == 0</c> 是客户端的新话题通知路径
+    /// （`PhoneMsgLogic.lua:MakeNewLetterReplyInfo`）；兼容响应但不记录玩家选择。
     /// </summary>
     private Task HandleLetterReply(ClientSession session, Player player, JsonObject? param)
     {
-        int msgId = ReadInt(param?["nMsgId"], 0);
-        int rawSelect = ReadInt(param?["nSelectId"], 0);
+        if (!GachaRequestLimits.TryInteger(param?["nMsgId"], out int msgId) || msgId <= 0 ||
+            !GachaRequestLimits.TryInteger(param?["nSelectId"], out int rawSelect))
+        {
+            Fail(session, CmdLetter, ErrGeneric);
+            return Task.CompletedTask;
+        }
 
         var topicCfg = _table.Letter(msgId);
         if (topicCfg is null)
@@ -437,10 +461,41 @@ public sealed class PhoneMsgFeature : IGameFeature
         }
 
         var state = LoadState(player);
-        var letter = EnsureLetter(state, topicCfg.NpcId);
-        var topic = EnsureTopic(letter, msgId);
+        if (!state.Letters.TryGetValue(topicCfg.NpcId, out var letter) ||
+            !letter.Topics.TryGetValue(msgId, out var topic))
+        {
+            Fail(session, CmdLetter, ErrGeneric);
+            return Task.CompletedTask;
+        }
+
+        // Lua MakeNewLetterReplyInfo treats zero as a new-topic notification,
+        // not a player choice. Preserve the compatibility response without saving
+        // fake progress, changing ordering time, or growing the history on retries.
+        if (rawSelect == 0)
+        {
+            Reply(session, CmdLetter, new JsonObject
+            {
+                ["nNpcId"] = topicCfg.NpcId,
+                ["nMsgId"] = msgId,
+                ["nSelectId"] = 0,
+            });
+            PushAll(session, player);
+            return Task.CompletedTask;
+        }
 
         // ★ 把「候选序号」翻译成客户端要的 位置*10+分支
+        if (rawSelect > 0)
+        {
+            var (position, previousBranch) = PhoneDialog.Last(topic);
+            int next = PhoneMsgTable.NextReplyPos(topicCfg, position, previousBranch, playerReply: true);
+            if (PhoneDialog.Complete(topicCfg, topic) || next == 0 ||
+                rawSelect > topicCfg.Lines[next - 1].Info.Count ||
+                topicCfg.Lines[next - 1].Info[rawSelect - 1] is "NULL" or "0")
+            {
+                Fail(session, CmdLetter, ErrGeneric);
+                return Task.CompletedTask;
+            }
+        }
         int replyId = BuildReplyId(topicCfg, topic, rawSelect);
 
         topic.MsgIds.Add(replyId);
@@ -501,7 +556,8 @@ public sealed class PhoneMsgFeature : IGameFeature
         //   （实测 358 个选择行全是这个形状）⇒ 两者天然对齐，无需再映射。
         int branch = rawSelect;
 
-        int nextPos = PhoneMsgTable.NextReplyPos(topicCfg, curPos, branch);
+        int previousBranch = PhoneDialog.Last(topic).Branch;
+        int nextPos = PhoneMsgTable.NextReplyPos(topicCfg, curPos, previousBranch, playerReply: true);
         if (nextPos <= 0)
             nextPos = curPos;   // 退化：至少保证位置非 0
 
@@ -522,8 +578,12 @@ public sealed class PhoneMsgFeature : IGameFeature
     /// </summary>
     private Task HandleBbsReply(ClientSession session, Player player, JsonObject? param)
     {
-        int msgId = ReadInt(param?["nMsgId"], 0);
-        int selectId = ReadInt(param?["nSelectId"], 0);
+        if (!GachaRequestLimits.TryInteger(param?["nMsgId"], out int msgId) || msgId <= 0 ||
+            !GachaRequestLimits.TryInteger(param?["nSelectId"], out int selectId))
+        {
+            Fail(session, CmdBbs, ErrGeneric);
+            return Task.CompletedTask;
+        }
 
         var cfg = _table.Bbs(msgId);
         if (cfg is null)
@@ -535,6 +595,14 @@ public sealed class PhoneMsgFeature : IGameFeature
         }
 
         var state = LoadState(player);
+        if ((selectId > 0 && (!state.Bbs.ContainsKey(msgId) || state.BbsApply.Contains(msgId))) ||
+            (selectId == 0 && (cfg.NpcId != 0 || !state.BbsApply.Contains(msgId))) ||
+            (selectId > 0 && (selectId > cfg.PlayerOptions.Count || cfg.PlayerOptions[selectId - 1] is "NULL" or "0")) ||
+            (state.Bbs.TryGetValue(msgId, out var existing) && existing.ReplyInfo > 0))
+        {
+            Fail(session, CmdBbs, ErrGeneric);
+            return Task.CompletedTask;
+        }
         bool isNew = !state.Bbs.ContainsKey(msgId);
         var bbs = EnsureBbs(state, msgId);
         if (selectId > 0)
@@ -635,7 +703,7 @@ public sealed class PhoneMsgFeature : IGameFeature
     /// </summary>
     private Task HandleLetterAward(ClientSession session, Player player, JsonObject? param)
     {
-        int msgId = ReadInt(param?["nMsgId"], 0);
+        int msgId = StrictPositiveId(param?["nMsgId"]);
         var cfg = _table.Letter(msgId);
         if (cfg is null)
         {
@@ -645,10 +713,14 @@ public sealed class PhoneMsgFeature : IGameFeature
         }
 
         var state = LoadState(player);
-        var letter = EnsureLetter(state, cfg.NpcId);
-        var topic = EnsureTopic(letter, msgId);
+        if (!state.Letters.TryGetValue(cfg.NpcId, out var letter) ||
+            !letter.Topics.TryGetValue(msgId, out var topic))
+        {
+            Fail(session, CmdLetterAward, ErrGeneric);
+            return Task.CompletedTask;
+        }
 
-        if (topic.AwardFlag > 0)
+        if (topic.AwardFlag > 0 || state.ClaimedLetters.Contains(msgId))
         {
             Log.Warn($"[session {session.Id}] PhoneMsg nCmd=7 话题 {msgId} 已领过奖" +
                      $"（awardflag={topic.AwardFlag}）→ nError={ErrGeneric}");
@@ -656,16 +728,21 @@ public sealed class PhoneMsgFeature : IGameFeature
             return Task.CompletedTask;
         }
 
+        if (!PhoneDialog.Complete(cfg, topic))
+        {
+            Fail(session, CmdLetterAward, ErrGeneric);
+            return Task.CompletedTask;
+        }
+
         topic.AwardFlag = 1;
+        state.ClaimedLetters.Add(msgId);
         SaveState(player, state);
 
         // 选项：客户端按最后一次选择结算（AwardInfo 下标是 nSelectId，1-based）
         // ★★ MsgIds 里存的是 `位置*10+分支` 的复合编码（第十四轮改），
         //    取好感度经验要用**分支**部分，不能直接拿整个 replyId 当下标 ——
         //    否则 31 会去查 AwardInfo[31]（越界 ⇒ 恒 0 好感度）。
-        int selectId = topic.MsgIds.Count > 0
-            ? Math.Max(1, PhoneMsgTable.ReplyBranchOf(topic.MsgIds[^1]))
-            : 1;
+        int selectId = PhoneDialog.AwardSelection(topic);
 
         Log.Info($"[session {session.Id}] PhoneMsg nCmd=7 私信领奖 npc={cfg.NpcId} 话题={msgId} " +
                  $"选项={selectId} 好感度经验={PhoneMsgTable.AwardExpAt(cfg.AwardExp, selectId)}");
@@ -693,7 +770,7 @@ public sealed class PhoneMsgFeature : IGameFeature
     /// </summary>
     private Task HandleLetterDelete(ClientSession session, Player player, JsonObject? param)
     {
-        int msgId = ReadInt(param?["nMsgId"], 0);
+        int msgId = StrictPositiveId(param?["nMsgId"]);
         var cfg = _table.Letter(msgId);
         if (cfg is null)
         {
@@ -702,14 +779,18 @@ public sealed class PhoneMsgFeature : IGameFeature
         }
 
         var state = LoadState(player);
+        RememberLetterHistory(state);
         bool removed = false;
         if (state.Letters.TryGetValue(cfg.NpcId, out var letter))
         {
+            if (letter.Topics.TryGetValue(msgId, out var deletedTopic))
+                state.ArchivedTopics[msgId] = TopicState.FromJson(deletedTopic.ToJson());
             removed = letter.Topics.Remove(msgId);
             // 该 NPC 一条话题都不剩 ⇒ 整条对话也删掉（客户端列表按 NPC 分组）
             if (letter.Topics.Count == 0)
                 state.Letters.Remove(cfg.NpcId);
         }
+        if (removed) state.DeletedLetters.Add(msgId);
         SaveState(player, state);
 
         Log.Info($"[session {session.Id}] PhoneMsg nCmd=10 删除私信 npc={cfg.NpcId} 话题={msgId}" +
@@ -734,7 +815,7 @@ public sealed class PhoneMsgFeature : IGameFeature
     /// </summary>
     private Task HandleLetterGet(ClientSession session, Player player, JsonObject? param)
     {
-        int msgId = ReadInt(param?["nMsgId"], 0);
+        int msgId = StrictPositiveId(param?["nMsgId"]);
         var cfg = _table.Letter(msgId);
         if (cfg is null)
         {
@@ -743,10 +824,19 @@ public sealed class PhoneMsgFeature : IGameFeature
         }
 
         var state = LoadState(player);
+        if (!CanReceiveLetter(player, state, cfg))
+        {
+            Fail(session, CmdLetterGet, ErrGeneric);
+            return Task.CompletedTask;
+        }
+        state.DeletedLetters.Remove(msgId);
         var letter = EnsureLetter(state, cfg.NpcId);
         bool isNew = !letter.Topics.ContainsKey(msgId);
-        EnsureTopic(letter, msgId);
-        letter.CreateTime = Now();
+        if (isNew && state.ArchivedTopics.Remove(msgId, out var archived))
+            letter.Topics[msgId] = archived;
+        else
+            EnsureTopic(letter, msgId);
+        if (isNew) letter.CreateTime = Now();
         SaveState(player, state);
 
         Log.Info($"[session {session.Id}] PhoneMsg nCmd=11 获取私信 npc={cfg.NpcId} 话题={msgId}" +
@@ -760,6 +850,10 @@ public sealed class PhoneMsgFeature : IGameFeature
             ["nMsgId"] = msgId,
             ["nSelectId"] = 0,
         });
+        // The delta callback may mutate native cache through AddLetterReplyInfo.
+        // History must finish with the exact saved branch/award snapshot.
+        if (letter.Topics[msgId].MsgIds.Count > 0 || state.ClaimedLetters.Contains(msgId))
+            PushAll(session, player);
         return Task.CompletedTask;
     }
 
@@ -794,7 +888,7 @@ public sealed class PhoneMsgFeature : IGameFeature
     ///     <c>LetterInfoNew</c> 找到话题（其余指向旧表/已下线内容）。</item>
     /// </list>
     /// </summary>
-    internal void BackfillTriggers(ClientSession session, Player player)
+    internal bool BackfillTriggers(ClientSession session, Player player)
     {
         var state = LoadState(player);
         int addedLetters = 0, addedBbs = 0;
@@ -804,6 +898,7 @@ public sealed class PhoneMsgFeature : IGameFeature
         foreach (var ev in _table.AllLetterEvents)
         {
             var cfg = _table.Letter(ev.Id);
+            if (state.DeletedLetters.Contains(ev.Id)) continue;
             if (cfg is null)
                 continue;                       // 孤儿配置（指向旧表 LetterInfo.txt）
 
@@ -832,7 +927,7 @@ public sealed class PhoneMsgFeature : IGameFeature
             if (state.Bbs.ContainsKey(ev.Id))
                 continue;
 
-            if (!Satisfied(player, state, ev, cfg.NpcId, out string why))
+            if (!Satisfied(player, state, ev, cfg.NpcId, out string why, forum: true))
                 continue;
 
             EnsureBbs(state, ev.Id);
@@ -845,21 +940,22 @@ public sealed class PhoneMsgFeature : IGameFeature
         }
 
         if (addedLetters == 0 && addedBbs == 0)
-            return;
+            return false;
 
         SaveState(player, state);
-        Log.Info($"[session {session.Id}] PhoneMsg 登录补发触发内容：私信 +{addedLetters} 条、" +
+        Log.Info($"[session {session.Id}] PhoneMsg 补发触发内容：私信 +{addedLetters} 条、" +
                  $"帖子 +{addedBbs} 个（客户端只判剧情类，其余 8 类是服务端职责）" +
                  $"；样例 {string.Join(" ", reasons)}");
+        return true;
     }
 
     /// <summary>
     /// 判定一条触发是否已满足（多条件 AND）。<paramref name="why"/> 回填命中原因（写日志用）。
     ///
-    /// ★ 含无法判定的条件（类型 1 剧情、或未知类型）时返回 false —— **保守不补发**。
+    /// ★ 含无法判定的条件（缺失剧情路径、或未知类型）时返回 false —— **保守不补发**。
     /// </summary>
     private bool Satisfied(Player player, PhoneState state, PhoneEvent ev,
-                           int ownerNpcId, out string why)
+                           int ownerNpcId, out string why, bool forum = false)
     {
         why = "";
         if (ev.Conds.Count == 0)
@@ -868,6 +964,17 @@ public sealed class PhoneMsgFeature : IGameFeature
         var hits = new List<string>();
         foreach (var c in ev.Conds)
         {
+            if (forum && c.Type == 2)
+            {
+                int need = LastInt(c.Info);
+                var config = _table.Bbs(need);
+                if (config is null || !state.Bbs.TryGetValue(need, out var post) || state.BbsApply.Contains(need) ||
+                    (config.ReplyIdx > 0 && (post.ReplyInfo <= 0 || post.ReplyInfo > config.PlayerOptions.Count ||
+                        config.PlayerOptions[post.ReplyInfo - 1] is "0" or "NULL")))
+                    return false;
+                hits.Add($"论坛{need}已完成");
+                continue;
+            }
             if (!SatisfiedOne(player, state, c, ownerNpcId, out string one))
                 return false;
             hits.Add(one);
@@ -889,40 +996,30 @@ public sealed class PhoneMsgFeature : IGameFeature
         why = "";
         switch (c.Type)
         {
-            // 1 剧情：★★★ 第十二轮改为「剧情已读即视为满足」。
-            //
-            // 背景：客户端 CheckEvent 的类型 1 分支是**事件式**判定
-            //   （PhoneMsgLogic.lua:1956 `tbData[1] == tbEvent.LimitInfo[1]`）——
-            //   只在 CartoonData:SetIsRead 那一刻拿「刚看完的路径」比一次，错过不补；
-            //   且 SetIsRead 开头 `if self:CheckById(id) then return end` 会让
-            //   重看同一段剧情直接短路 ⇒ 补不回来。
-            //
-            // GM 全解锁账号跳过了剧情播放 ⇒ 那 177 条类型 1 触发永远不会发生。
-            // 现在 GmUnlock.ApplyCartoons 把剧情已读位域(group 39)全填 ⇒
-            // 语义上所有剧情都已看过 ⇒ 这里按「已读」认定满足，把内容补出来。
-            //
-            // ★ 判据用「位域是否已填」而不是无条件 true：非全解锁账号行为不变
-            //   （只有真看过才补）。
-            // ★★ 但**做不到「精确到某一段剧情」**：路径→id 的映射表 CartoonFileId.txt
-            //   不在任何 .u 里（取证见 GmUnlock.ApplyCartoons）⇒ 只能判「整个位域是否全开」
-            //   这一粒度。对全解锁账号来说这正是想要的语义。
+            // Resolve the exact original story bit; unrelated read stories must not
+            // unlock this event. Unknown paths stay locked rather than guessing.
             case 1:
             {
-                if (!AllCartoonsRead(player))
-                    return false;
+                if (!_cartoons.IsRead(player, c.Info)) return false;
                 why = "剧情已读";
                 return true;
             }
 
-            // 2 私信完成：该话题已存在且玩家已回过（msgids 非空）
+            // 2 私信完成：配置路径已走到结束，不以“曾回复过一次”代替。
             case 2:
             {
                 int need = LastInt(c.Info);
                 if (need <= 0)
                     return false;
+                if (state.CompletedLetters.Contains(need) || state.ClaimedLetters.Contains(need))
+                {
+                    why = $"私信{need}历史已完成";
+                    return true;
+                }
                 foreach (var l in state.Letters.Values)
                 {
-                    if (l.Topics.TryGetValue(need, out var t) && t.MsgIds.Count > 0)
+                    if (l.Topics.TryGetValue(need, out var t) && _table.Letter(need) is { } config &&
+                        PhoneDialog.Complete(config, t))
                     {
                         why = $"私信{need}已回";
                         return true;
@@ -954,25 +1051,26 @@ public sealed class PhoneMsgFeature : IGameFeature
             // 4 时间窗：yyyyMMddHH-yyyyMMddHH，按**本地时间**判（客户端口径，见 HANDOFF 时区条）
             case 4:
             {
-                var seg = c.Info.Trim().Trim('[', ']').Split('-');
-                if (seg.Length < 2
-                    || !long.TryParse(seg[0].Trim(), out long from)
-                    || !long.TryParse(seg[1].Trim(), out long to))
-                    return false;
-                long now = long.Parse(DateTime.Now.ToString("yyyyMMddHH"));
-                if (now < from || now > to)
-                    return false;
-                why = $"档期{from}~{to}内";
+                if (!PhoneEventWindow.Contains(c.Info, DateTime.Now)) return false;
+                why = $"档期{c.Info}内";
                 return true;
             }
 
-            // 5 少女信息解锁：拥有该少女即视为已解锁其信息
+            // Secret TypeDec keys identify both the girl and the information row.
+            // Owning an unrelated girl parsed from the last number is insufficient.
             case 5:
             {
-                int need = LastInt(c.Info);
-                if (need <= 0 || player.GetGirl((uint)need) is null)
+                var key = c.Info.Trim().Split('.');
+                if (key.Length != 3 || key[2] != "TypeDec" ||
+                    !uint.TryParse(key[0], out uint girlId) || girlId == 0 ||
+                    !int.TryParse(key[1], out int secretId) || secretId <= 0 ||
+                    player.GetGirl(girlId) is null) return false;
+                var secret = _girlLove.SecretsOf(girlId).FirstOrDefault(s => s.Index == secretId);
+                if (secret is null) return false;
+                bool gated = secret.Level > 0 || secret.Gift.Length >= 4;
+                if (gated && GirlLoveFeature.GetVar(player, girlId, 100 + secretId - 1) == 0)
                     return false;
-                why = $"已有少女{need}";
+                why = $"少女{girlId}信息{secretId}已解锁";
                 return true;
             }
 
@@ -983,7 +1081,7 @@ public sealed class PhoneMsgFeature : IGameFeature
                 if (p.Length < 4)
                     return false;
                 bool has = player.Items.Any(i =>
-                    i.Genre == (uint)p[0] && i.Detail == (uint)p[1] &&
+                    i.Count > 0 && i.Genre == (uint)p[0] && i.Detail == (uint)p[1] &&
                     i.Particular == (uint)p[2] && i.Level == (uint)p[3]);
                 if (!has)
                     return false;
@@ -997,10 +1095,13 @@ public sealed class PhoneMsgFeature : IGameFeature
                 int need = LastInt(c.Info);
                 if (need <= 0)
                     return false;
-                int pro = player.GetTask(AchieveTaskGroup, need);
-                if (pro <= 0)
-                    return false;
-                why = $"成就{need}进度{pro}";
+                var entry = _ctx.Missions.GetAchieveOther(need);
+                if (entry is null) return false;
+                int required = entry.RequiredCount(achieveKey: true);
+                int progress = Math.Max(MissionFeature.ProgressOf(player.GetTask(entry.Group, need)),
+                    MissionFeature.DerivedProgress(player, entry));
+                if (required <= 0 || progress < required) return false;
+                why = $"成就{need}进度{progress}≥{required}";
                 return true;
             }
 
@@ -1035,23 +1136,6 @@ public sealed class PhoneMsgFeature : IGameFeature
             default:
                 return false;
         }
-    }
-
-    /// <summary>成就进度所在的任务值 group（与 <c>ActivityAchieveFeature</c> 一致）。</summary>
-    private const int AchieveTaskGroup = 18;
-
-    /// <summary>
-    /// 「剧情已读位域是否已全开」—— 即 <see cref="GmUnlock.ApplyCartoons"/> 是否跑过。
-    ///
-    /// 判据取**抽样**而不是遍历 401 个 taskId：全填是一次性、整段写入的
-    /// （要么 401 个都填了，要么一个都没填），所以查首尾两个足够，且这条判定
-    /// 每条触发都会走一次、要便宜。
-    /// </summary>
-    private static bool AllCartoonsRead(Player player)
-    {
-        const int allRead = int.MaxValue;      // = 0x7FFFFFFF，与 GmUnlock.ApplyCartoons 一致
-        return (player.GetTask(GmUnlock.CartoonGroup, GmUnlock.CartoonMinTaskId) & allRead) == allRead
-            && (player.GetTask(GmUnlock.CartoonGroup, GmUnlock.CartoonMaxTaskId) & allRead) == allRead;
     }
 
     /// <summary>
@@ -1118,7 +1202,7 @@ public sealed class PhoneMsgFeature : IGameFeature
     /// </summary>
     private Task HandleLetterEvent(ClientSession session, Player player, JsonObject? param)
     {
-        int msgId = ReadInt(param?["nMsgId"], 0);
+        int msgId = StrictPositiveId(param?["nMsgId"]);
         var cfg = _table.Letter(msgId);
         if (cfg is null)
         {
@@ -1131,6 +1215,16 @@ public sealed class PhoneMsgFeature : IGameFeature
         }
 
         var state = LoadState(player);
+        if (state.DeletedLetters.Contains(msgId))
+        {
+            Reply(session, CmdLetterEvent, new JsonObject());
+            return Task.CompletedTask;
+        }
+        if (!CanReceiveLetter(player, state, cfg))
+        {
+            Fail(session, CmdLetterEvent, ErrGeneric);
+            return Task.CompletedTask;
+        }
         var letter = EnsureLetter(state, cfg.NpcId);
         if (letter.Topics.ContainsKey(msgId))
         {
@@ -1162,7 +1256,7 @@ public sealed class PhoneMsgFeature : IGameFeature
     /// </summary>
     private Task HandleBbsEvent(ClientSession session, Player player, JsonObject? param)
     {
-        int msgId = ReadInt(param?["nMsgId"], 0);
+        int msgId = StrictPositiveId(param?["nMsgId"]);
         var cfg = _table.Bbs(msgId);
         if (cfg is null)
         {
@@ -1180,6 +1274,12 @@ public sealed class PhoneMsgFeature : IGameFeature
             return Task.CompletedTask;
         }
 
+        if (_table.BbsEvent(msgId) is not { } ev ||
+            !Satisfied(player, state, ev, cfg.NpcId, out _, forum: true))
+        {
+            Fail(session, CmdBbsEvent, ErrGeneric);
+            return Task.CompletedTask;
+        }
         EnsureBbs(state, msgId);
 
         // ★ NpcId == 0 的帖子是「玩家可发表」的 ⇒ 同时进可发表列表（nCmd 9 的语义）
@@ -1348,7 +1448,9 @@ public sealed class PhoneMsgFeature : IGameFeature
             return;
         }
 
+        var unlockedStories = GirlLoveFeature.UnlockStories(_girlLove, player, (uint)npcId);
         _ctx.Store.Save(player);
+        GameNotify.PushTaskValues(session, unlockedStories);
 
         // ★ 好感度存 protobuf 不存任务值 ⇒ 必须推 pf 1030（docs/05 §27 那条教训）
         var girl = player.GetGirl((uint)npcId);
@@ -1375,8 +1477,29 @@ public sealed class PhoneMsgFeature : IGameFeature
         return PhoneState.FromJson(node as JsonObject);
     }
 
+    private static int StrictPositiveId(JsonNode? node)
+        => node is JsonValue value && value.TryGetValue<int>(out int id) && id > 0 ? id : 0;
+
+    private bool CanReceiveLetter(Player player, PhoneState state, LetterTopic cfg)
+        => state.ReceivedLetters.Contains(cfg.Id) || state.CompletedLetters.Contains(cfg.Id) ||
+           state.ClaimedLetters.Contains(cfg.Id) ||
+           (state.Letters.TryGetValue(cfg.NpcId, out var letter) && letter.Topics.ContainsKey(cfg.Id)) ||
+           (_table.LetterEvent(cfg.Id) is { } ev && Satisfied(player, state, ev, cfg.NpcId, out _));
+
+    private void RememberLetterHistory(PhoneState state)
+    {
+        foreach (var letter in state.Letters.Values)
+            foreach (var topic in letter.Topics.Values)
+            {
+                state.ReceivedLetters.Add(topic.TopicId);
+                if (_table.Letter(topic.TopicId) is { } cfg && PhoneDialog.Complete(cfg, topic))
+                    state.CompletedLetters.Add(topic.TopicId);
+            }
+    }
+
     private void SaveState(Player player, PhoneState state)
     {
+        RememberLetterHistory(state);
         player.Extra[ExtraKey] = state.ToJson();
         _ctx.Store.Save(player);
     }

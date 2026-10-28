@@ -94,8 +94,12 @@ public class GmDebugEditorTests
 
         await SendAsync(h, "GM:AddAllCardItem();");
 
-        Assert.Equal(16, h.Player.Girls.Count);
-        Assert.Equal(268, h.Player.Items.Count(i => i.Genre == CharacterCardTable.CardGenre));
+        var expected = CharacterCardTable.Load(TestPaths.SettingDir).All
+            .Where(c => GmUnlock.IsValidGirlId(c.D)).ToArray();
+        Assert.Equal(expected.Select(c => c.D).Distinct().Order(), h.Player.Girls.Select(g => g.Girlid).Order());
+        Assert.Equal(expected.Select(c => (c.G, c.D, c.P, c.L)).Order(),
+            h.Player.Items.Where(i => i.Genre == CharacterCardTable.CardGenre)
+                .Select(i => (i.Genre, i.Detail, i.Particular, i.Level)).Order());
     }
 
     // ================= 玩家数值 =================

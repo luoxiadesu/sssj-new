@@ -58,6 +58,36 @@ public class GirlDressFeatureTests
                 ? $"{{\"sCmd\":\"{GirlDressFeature.CmdSetModelInFight}\",\"nId\":{girlId}}}"
                 : $"{{\"sCmd\":\"{GirlDressFeature.CmdSetModelInFight}\",\"nId\":{girlId},\"nUse\":{use}}}");
 
+    [Theory]
+    [InlineData(777)]
+    [InlineData(-1)]
+    [InlineData(1711)] // storage alias of 7001 is not a configured model
+    public async Task UnconfiguredModelCannotUsePositiveOwnershipFlag(int model)
+    {
+        using var h = await FeatureHarness.CreateAsync("dress-config-boundary");
+        var girl = Seed(h, 9, 1);
+        GiveSuit(h, 9, model, GirlDressFeature.SuitNew);
+        await ChangeClothAsync(h, 9, model);
+        Assert.Equal(GirlDressFeature.ErrGeneric, Reply(h)["nError"]!.GetValue<int>());
+        Assert.Equal(1u, girl.Modelid);
+        Assert.Equal(GirlDressFeature.SuitNew, GirlDressFeature.GetSuitValue(h.Player, 9, model));
+        Assert.DoesNotContain(1030, h.PushedPf);
+    }
+
+    [Fact]
+    public async Task ConfiguredPermanentOutfitWorksWithoutSourceItem()
+    {
+        using var h = await FeatureHarness.CreateAsync("dress-permanent-no-source");
+        var card = CharacterCardTable.Load(TestPaths.SettingDir).ForGirl(1).First();
+        var girl = Seed(h, 1);
+        h.Player.Items.Clear();
+        GiveSuit(h, 1, card.ModelId, GirlDressFeature.SuitNew);
+        await ChangeClothAsync(h, 1, card.ModelId);
+        Assert.Null(Reply(h)["nError"]);
+        Assert.Equal((uint)card.ModelId, girl.Modelid);
+        Assert.Equal(GirlDressFeature.SuitWorn, GirlDressFeature.GetSuitValue(h.Player, 1, card.ModelId));
+        Assert.Equal(girl.Modelid, new PlayerStore(h.Options).Load(h.Player.Account)!.GetGirl(1)!.Modelid);
+    }
     // ================= SetMainGirl =================
 
     [Fact]
@@ -116,6 +146,54 @@ public class GirlDressFeatureTests
         Assert.Null(r["nError"]);
     }
 
+    [Fact]
+    public async Task PortraitOnlySuitDisablesFightModelBeforeAnyFollowupAndPersists()
+    {
+        using var h = await FeatureHarness.CreateAsync("dress-atomic-no-fight");
+        var suit = GirlDressTable.Load(TestPaths.SettingDir).All.First(r => !r.HasModel);
+        var girl = Seed(h, suit.GirlId);
+        GiveSuit(h, suit.GirlId, suit.ModelId, GirlDressFeature.SuitNew);
+        int group = GirlLoveFeature.VarGroup(suit.GirlId);
+        int task = GirlLoveFeature.VarTaskId(suit.GirlId, GirlDressFeature.VarIsFightModel);
+        h.Player.SetTask(group, task, 1);
+        await ChangeClothAsync(h, suit.GirlId, suit.ModelId);
+        Assert.Null(Reply(h)["nError"]);
+        Assert.Equal((uint)suit.ModelId, girl.Modelid);
+        Assert.Equal(0, h.Player.GetTask(group, task));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(0, saved.GetTask(group, task));
+        Assert.Equal(girl.Modelid, saved.GetGirl(suit.GirlId)!.Modelid);
+        Assert.True(await h.WaitForPfAsync(1026));
+        // The ordinary client's duplicate disable request must remain harmless.
+        await FightModelAsync(h, suit.GirlId, null);
+        Assert.True(Reply(h)["bSuccess"]!.GetValue<bool>());
+        Assert.Equal(0, h.Player.GetTask(group, task));
+    }
+
+    [Fact]
+    public async Task LoginRepairsPortraitOnlyFightFlagButKeepsSupportedSuitEnabled()
+    {
+        using var h = await FeatureHarness.CreateAsync("dress-repair-no-fight");
+        var dress = GirlDressTable.Load(TestPaths.SettingDir);
+        var noModel = dress.All.First(r => !r.HasModel);
+        var supported = dress.All.First(r => r.HasModel && r.GirlId != noModel.GirlId);
+        Seed(h, noModel.GirlId, (uint)noModel.ModelId);
+        Seed(h, supported.GirlId, (uint)supported.ModelId);
+        int badGroup = GirlLoveFeature.VarGroup(noModel.GirlId);
+        int badTask = GirlLoveFeature.VarTaskId(noModel.GirlId, GirlDressFeature.VarIsFightModel);
+        int goodGroup = GirlLoveFeature.VarGroup(supported.GirlId);
+        int goodTask = GirlLoveFeature.VarTaskId(supported.GirlId, GirlDressFeature.VarIsFightModel);
+        h.Player.SetTask(badGroup, badTask, 1);
+        h.Player.SetTask(goodGroup, goodTask, 1);
+        h.RunPrepareHooks();
+        Assert.Equal(0, h.Player.GetTask(badGroup, badTask));
+        Assert.Equal(1, h.Player.GetTask(goodGroup, goodTask));
+        Assert.Equal((uint)noModel.ModelId, h.Player.GetGirl(noModel.GirlId)!.Modelid);
+        Assert.Equal(0, new PlayerStore(h.Options).Load(h.Player.Account)!.GetTask(badGroup, badTask));
+        h.RunPrepareHooks();
+        Assert.Equal(0, h.Player.GetTask(badGroup, badTask));
+    }
+
     // ================= ChangeCloth =================
 
     [Fact]
@@ -123,15 +201,15 @@ public class GirlDressFeatureTests
     {
         using var h = await FeatureHarness.CreateAsync("dress-change");
         var girl = Seed(h, 1, modelId: 1);
-        GiveSuit(h, 1, 5, GirlDressFeature.SuitWorn);
+        GiveSuit(h, 1, 2, GirlDressFeature.SuitWorn);
 
-        await ChangeClothAsync(h, 1, 5);
+        await ChangeClothAsync(h, 1, 2);
 
-        Assert.Equal(5u, girl.Modelid);
+        Assert.Equal(2u, girl.Modelid);
         var r = Reply(h);
         // ★ 回包必须带 nId + nSuit（GirlLogic.lua:614 要用它们调 ui:OnDragCloth）
         Assert.Equal(1, r["nId"]!.GetValue<int>());
-        Assert.Equal(5, r["nSuit"]!.GetValue<int>());
+        Assert.Equal(2, r["nSuit"]!.GetValue<int>());
         Assert.Null(r["nError"]);
     }
 
@@ -140,9 +218,9 @@ public class GirlDressFeatureTests
     {
         using var h = await FeatureHarness.CreateAsync("dress-change-push");
         Seed(h, 1, modelId: 1);
-        GiveSuit(h, 1, 5, GirlDressFeature.SuitWorn);
+        GiveSuit(h, 1, 2, GirlDressFeature.SuitWorn);
 
-        await ChangeClothAsync(h, 1, 5);
+        await ChangeClothAsync(h, 1, 2);
 
         // ★★ modelid 在 protobuf 里 ⇒ 只有 pf 1030 GirlDataNtf 能让客户端看到
         Assert.True(await h.WaitForPfAsync(GamePf.GirlDataNtf),
@@ -156,7 +234,7 @@ public class GirlDressFeatureTests
         var girl = Seed(h, 1, modelId: 1);
         // 故意不给 SuitValue
 
-        await ChangeClothAsync(h, 1, 777);
+        await ChangeClothAsync(h, 1, 2);
 
         Assert.Equal(1u, girl.Modelid);
         // ★ 仍要回包（OnChangeClothError 是空函数 ⇒ 玩家零反馈，但遮罩要解开）
@@ -168,13 +246,13 @@ public class GirlDressFeatureTests
     {
         using var h = await FeatureHarness.CreateAsync("dress-change-new");
         Seed(h, 1, modelId: 1);
-        GiveSuit(h, 1, 5, GirlDressFeature.SuitNew);
+        GiveSuit(h, 1, 2, GirlDressFeature.SuitNew);
 
-        await ChangeClothAsync(h, 1, 5);
+        await ChangeClothAsync(h, 1, 2);
 
         // ★ UI_GirlClothes.lua:846 IsNew = (SuitValue == 1) ⇒ 穿过一次要清掉红点
         Assert.Equal(GirlDressFeature.SuitWorn,
-                     GirlDressFeature.GetSuitValue(h.Player, 1, 5));
+                     GirlDressFeature.GetSuitValue(h.Player, 1, 2));
     }
 
     [Fact]
@@ -291,10 +369,10 @@ public class GirlDressFeatureTests
     {
         using var h = await FeatureHarness.CreateAsync("dress-coexist");
         Seed(h, 1, modelId: 1);
-        GiveSuit(h, 1, 5, GirlDressFeature.SuitWorn);
+        GiveSuit(h, 1, 2, GirlDressFeature.SuitWorn);
 
         // ① 本域（协处理器）
-        await ChangeClothAsync(h, 1, 5);
+        await ChangeClothAsync(h, 1, 2);
         Assert.Equal(GirlDressFeature.CmdChangeCloth, Reply(h)["sCmd"]!.GetValue<string>());
 
         // ② 特训域（主 handler）—— 必须仍然响应
@@ -369,6 +447,78 @@ public class GirlDressFeatureTests
         // ★ 幂等：只把 0 → 1，不动 >0 的
         Assert.Equal(GirlDressFeature.SuitWorn,
                      GirlDressFeature.GetSuitValue(h.Player, 1, card.ModelId));
+    }
+
+    [Fact]
+    public async Task LoginCountsPermanentOutfitsWithoutSourceItemsAndKeepsWornState()
+    {
+        using var h = await FeatureHarness.CreateAsync("dress-permanent-count");
+        var suit = GirlDressTable.Load(TestPaths.SettingDir).All.First(r => r.Gdpl is not null);
+        Seed(h, suit.GirlId);
+        h.Player.Items.RemoveAll(i => i.Detail == suit.GirlId && i.Genre == 1 || i.Genre == 19);
+        var models = h.Module.CharacterCards.ForGirl(suit.GirlId).Select(c => c.ModelId)
+            .Concat(GirlDressTable.Load(TestPaths.SettingDir).All.Where(r => r.GirlId == suit.GirlId).Select(r => r.ModelId)).Distinct();
+        foreach (int model in models) GiveSuit(h, suit.GirlId, model, 0);
+        GiveSuit(h, suit.GirlId, suit.ModelId, GirlDressFeature.SuitWorn);
+        int group = GirlLoveFeature.VarGroup(suit.GirlId);
+        int countTask = GirlLoveFeature.VarTaskId(suit.GirlId, GirlDressFeature.VarSuitCount);
+        h.Player.SetTask(group, countTask, 99);
+        h.RunPrepareHooks();
+        Assert.Equal(1, h.Player.GetTask(group, countTask));
+        Assert.Equal(GirlDressFeature.SuitWorn, GirlDressFeature.GetSuitValue(h.Player, suit.GirlId, suit.ModelId));
+        Assert.Equal(1, new PlayerStore(h.Options).Load(h.Player.Account)!.GetTask(group, countTask));
+        h.RunPrepareHooks();
+        Assert.Equal(1, h.Player.GetTask(group, countTask));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(201)]
+    public async Task EmptyCardDoesNotUnlockOutfitAndCountUsesCorrectGirlGroup(int id)
+    {
+        using var h = await FeatureHarness.CreateAsync("dress-empty-card-" + id);
+        uint girlId = (uint)id;
+        Seed(h, girlId);
+        h.Player.Items.RemoveAll(i => i.Genre == 1 && i.Detail == girlId);
+        var cards = h.Module.CharacterCards.ForGirl(girlId).ToList();
+        Assert.NotEmpty(cards);
+        foreach (var card in cards) GiveSuit(h, girlId, card.ModelId, 0);
+        var selected = cards.First();
+        h.Player.Items.Add(new Item { Guid = 99001, Genre = 1, Detail = girlId,
+            Particular = selected.P, Level = selected.L, Count = 0 });
+        h.RunPrepareHooks();
+        Assert.Equal(0, GirlDressFeature.GetSuitValue(h.Player, girlId, selected.ModelId));
+        int group = GirlLoveFeature.VarGroup(girlId);
+        int countTask = GirlLoveFeature.VarTaskId(girlId, GirlDressFeature.VarSuitCount);
+        Assert.Equal(0, h.Player.GetTask(group, countTask));
+        h.Player.Items.Last().Count = 1;
+        h.RunPrepareHooks();
+        Assert.Equal(1, h.Player.GetTask(group, countTask));
+        h.Player.Items.Add(new Item { Guid = 99002, Genre = 1, Detail = girlId,
+            Particular = selected.P, Level = selected.L, Count = 1 });
+        h.RunPrepareHooks();
+        Assert.Equal(1, h.Player.GetTask(group, countTask));
+    }
+
+    [Fact]
+    public async Task EmptySkinStackDoesNotUnlockButLockedOwnedSkinDoes()
+    {
+        using var h = await FeatureHarness.CreateAsync("dress-empty-skin");
+        var dress = GirlDressTable.Load(TestPaths.SettingDir);
+        var suit = dress.All.First(r => r.Gdpl is not null);
+        Seed(h, suit.GirlId);
+        h.Player.Items.RemoveAll(i => i.Genre == 19);
+        GiveSuit(h, suit.GirlId, suit.ModelId, 0);
+        var q = suit.Gdpl!.Value;
+        var item = new Item { Guid = 99003, Genre = q.G, Detail = q.D,
+            Particular = q.P, Level = q.L, Count = 0, LockOn = 1 };
+        h.Player.Items.Add(item);
+        h.RunPrepareHooks();
+        Assert.Equal(0, GirlDressFeature.GetSuitValue(h.Player, suit.GirlId, suit.ModelId));
+        Assert.Empty(GirlDressFeature.GrantSuitsForItems(dress, h.Session, h.Player, new[] { item }));
+        item.Count = 1;
+        h.RunPrepareHooks();
+        Assert.Equal(GirlDressFeature.SuitNew, GirlDressFeature.GetSuitValue(h.Player, suit.GirlId, suit.ModelId));
     }
 
     // ================= 任务值编码 =================

@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+﻿using System.Text.Json.Nodes;
 using SssjServer.Game.Config;
 using SssjServer.Game.Handlers;
 using Xunit;
@@ -134,6 +134,7 @@ public class WeaponFeatureTests
     public async Task 强化_吃素材涨经验并升级()
     {
         using var h = await FeatureHarness.CreateAsync("weapon-strong");
+        h.Player.SetMoney(WeaponFeature.GoldMoneyId, 100000);
         var target = SeedWeapon(h, 1001);
         SeedWeapon(h, 1002);
         SeedWeapon(h, 1003);
@@ -161,6 +162,7 @@ public class WeaponFeatureTests
     public async Task 强化_推送pf1031让界面能刷新()
     {
         using var h = await FeatureHarness.CreateAsync("weapon-strong-push");
+        h.Player.SetMoney(WeaponFeature.GoldMoneyId, 100000);
         SeedWeapon(h, 1001);
         SeedWeapon(h, 1002);
 
@@ -213,6 +215,7 @@ public class WeaponFeatureTests
     public async Task 强化_不会超过当前等级上限()
     {
         using var h = await FeatureHarness.CreateAsync("weapon-strong-cap");
+        h.Player.SetMoney(WeaponFeature.GoldMoneyId, 100000);
         var t = WeaponTable.Load(TestPaths.SettingDir);
         int cap = t.MaxLevel(1, 0);                 // 0 突破时 40
         var target = SeedWeapon(h, 1001, level: (uint)cap);
@@ -230,6 +233,90 @@ public class WeaponFeatureTests
         // ★ 等级封在上限，但经验仍累加（`Lib.lua:689..691`）
         Assert.Equal((uint)cap, target.EnhanceLevel);
         Assert.True(target.EnhanceExp > 0, "撞上限时经验应继续累加，不是丢弃");
+    }
+
+    [Fact]
+    public async Task StrongFluid_ConsumesStackAndGold_AndPersists()
+    {
+        using var h = await FeatureHarness.CreateAsync("weapon-fluid");
+        var target = SeedWeapon(h, 1001);
+        var fluid = h.Player.AddItem(7, 3, 1, 1, 5);
+        h.Player.SetMoney(WeaponFeature.GoldMoneyId, 2000);
+        await SendAsync(h, $"{{\"nCmd\":1,\"nGuid\":1001,\"tbGuid\":[[{fluid.Guid},2]]}}");
+        Assert.Equal(WeaponFeature.ErrOk, Reply(h)["nError"]!.GetValue<int>());
+        var table = WeaponTable.Load(TestPaths.SettingDir);
+        var (level, exp) = table.DestLevel(1, 0, 1000, 40);
+        Assert.Equal((uint)level, target.EnhanceLevel);
+        Assert.Equal((uint)exp, target.EnhanceExp);
+        Assert.Equal(3u, fluid.Count);
+        Assert.Equal(1000, h.Player.GetMoney(WeaponFeature.GoldMoneyId));
+        Assert.True(await h.WaitForPfAsync(GamePf.ItemUpdateNtf));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(target.EnhanceLevel, saved.Items.Single(i => i.Guid == 1001).EnhanceLevel);
+        Assert.Equal(target.EnhanceExp, saved.Items.Single(i => i.Guid == 1001).EnhanceExp);
+        Assert.Equal(3u, saved.Items.Single(i => i.Guid == fluid.Guid).Count);
+        Assert.Equal(1000, saved.GetMoney(WeaponFeature.GoldMoneyId));
+    }
+
+    [Theory]
+    [InlineData("insufficient-money", 499, 1, false)]
+    [InlineData("insufficient-stack", 10000, 4, false)]
+    [InlineData("duplicate-guid", 10000, 1, true)]
+    [InlineData("zero-count", 10000, 0, false)]
+    [InlineData("negative-count", 10000, -1, false)]
+    public async Task StrongFluid_InvalidRequestDoesNotMutate(string name, int money, int count, bool duplicate)
+    {
+        using var h = await FeatureHarness.CreateAsync("weapon-fluid-" + name);
+        var target = SeedWeapon(h, 1001);
+        var fluid = h.Player.AddItem(7, 3, 1, 1, 3);
+        h.Player.SetMoney(WeaponFeature.GoldMoneyId, money);
+        string entries = $"[{fluid.Guid},{count}]";
+        if (duplicate) entries += $",[{fluid.Guid},1]";
+        await SendAsync(h, $"{{\"nCmd\":1,\"nGuid\":1001,\"tbGuid\":[{entries}]}}");
+        Assert.True(Reply(h)["nError"]!.GetValue<int>() > 0);
+        Assert.Equal(1u, target.EnhanceLevel);
+        Assert.Equal(0u, target.EnhanceExp);
+        Assert.Equal(3u, fluid.Count);
+        Assert.Equal(money, h.Player.GetMoney(WeaponFeature.GoldMoneyId));
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("[]")]
+    [InlineData("[0,1]")]
+    [InlineData("[4294967296,1]")]
+    [InlineData("[123]")]
+    [InlineData("[123,1,99]")]
+    [InlineData("{}")]
+    public async Task StrongFluid_MalformedEntryRejectsEntireBatch(string invalid)
+    {
+        using var h = await FeatureHarness.CreateAsync("weapon-fluid-malformed");
+        var target = SeedWeapon(h, 1001);
+        var fluid = h.Player.AddItem(7, 3, 1, 1, 3);
+        h.Player.SetMoney(WeaponFeature.GoldMoneyId, 10000);
+        await SendAsync(h, $"{{\"nCmd\":1,\"nGuid\":1001,\"tbGuid\":[[{fluid.Guid},1],{invalid}]}}");
+        Assert.True(Reply(h)["nError"]!.GetValue<int>() > 0);
+        Assert.Equal(1u, target.EnhanceLevel);
+        Assert.Equal(0u, target.EnhanceExp);
+        Assert.Equal(3u, fluid.Count);
+        Assert.Equal(10000, h.Player.GetMoney(WeaponFeature.GoldMoneyId));
+    }
+
+    [Fact]
+    public async Task StrongWeapon_UsesClientThirtyPercentFormulaAndGold()
+    {
+        using var h = await FeatureHarness.CreateAsync("weapon-fed-exp");
+        var target = SeedWeapon(h, 1001);
+        SeedWeapon(h, 1002, level: 10);
+        h.Player.SetMoney(WeaponFeature.GoldMoneyId, 10000);
+        await SendAsync(h, "{\"nCmd\":1,\"nGuid\":1001,\"tbGuid\":[[1002,1]]}");
+        Assert.Equal(WeaponFeature.ErrOk, Reply(h)["nError"]!.GetValue<int>());
+        var table = WeaponTable.Load(TestPaths.SettingDir);
+        int gained = table.RarityExp(1) + (int)Math.Floor(table.SumExpBelow(10) * 0.3);
+        var (level, exp) = table.DestLevel(1, 0, gained, 40);
+        Assert.Equal((uint)level, target.EnhanceLevel);
+        Assert.Equal((uint)exp, target.EnhanceExp);
+        Assert.Equal(10000 - table.RarityExp(1), h.Player.GetMoney(WeaponFeature.GoldMoneyId));
     }
 
     // ================= nCmd 2：分解 =================
@@ -324,14 +411,19 @@ public class WeaponFeatureTests
 
         var cost = t.BreakCostFor(1, 0)!;
         h.Player.SetMoney(cost.CurrencyId, cost.CurrencyCount + 1000);
+        SeedWeapon(h, 1002);
         long before = h.Player.GetMoney(cost.CurrencyId);
 
-        await SendAsync(h, "{\"nCmd\":3,\"nGuid\":1001,\"tbGuid\":[]}");
+        await SendAsync(h, "{\"nCmd\":3,\"nGuid\":1001,\"tbGuid\":[[1002,1]]}");
 
         Assert.Equal(WeaponFeature.ErrOk, Reply(h)["nError"]!.GetValue<int>());
         Assert.Equal(1u, target.BreakLevel);
         // ★ 扣款精确
         Assert.Equal(before - cost.CurrencyCount, h.Player.GetMoney(cost.CurrencyId));
+        Assert.DoesNotContain(h.Player.Items, i => i.Guid == 1002);
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(1u, saved.Items.Single(i => i.Guid == 1001).BreakLevel);
+        Assert.DoesNotContain(saved.Items, i => i.Guid == 1002);
         // 上限真的提升了
         Assert.True(t.MaxLevel(1, 1) > cap);
     }
@@ -355,13 +447,15 @@ public class WeaponFeatureTests
         using var h = await FeatureHarness.CreateAsync("weapon-break-poor");
         var t = WeaponTable.Load(TestPaths.SettingDir);
         var target = SeedWeapon(h, 1001, level: (uint)t.MaxLevel(1, 0));
+        SeedWeapon(h, 1002);
         var cost = t.BreakCostFor(1, 0)!;
         h.Player.SetMoney(cost.CurrencyId, cost.CurrencyCount - 1);
 
-        await SendAsync(h, "{\"nCmd\":3,\"nGuid\":1001,\"tbGuid\":[]}");
+        await SendAsync(h, "{\"nCmd\":3,\"nGuid\":1001,\"tbGuid\":[[1002,1]]}");
 
         Assert.True(Reply(h)["nError"]!.GetValue<int>() > 0);
         Assert.Equal(0u, target.BreakLevel);
+        Assert.Contains(h.Player.Items, i => i.Guid == 1002);
         Assert.Equal(cost.CurrencyCount - 1, h.Player.GetMoney(cost.CurrencyId));
     }
 
@@ -379,6 +473,41 @@ public class WeaponFeatureTests
 
         Assert.True(Reply(h)["nError"]!.GetValue<int>() > 0);
         Assert.Equal((uint)maxBreak, target.BreakLevel);
+    }
+
+    [Theory]
+    [InlineData("empty", "[]", 0, false)]
+    [InlineData("self", "[[1001,1]]", 0, false)]
+    [InlineData("duplicate", "[[1002,1],[1002,1]]", 0, false)]
+    [InlineData("locked", "[[1002,1]]", 1, false)]
+    [InlineData("wrong-template", "[[1002,1]]", 0, true)]
+    public async Task Break_InvalidMaterialsLeaveMoneyAndInventoryUnchanged(string name, string materials, uint locked, bool wrong)
+    {
+        using var h = await FeatureHarness.CreateAsync("weapon-break-invalid-" + name);
+        var target = SeedWeapon(h, 1001, level: 40);
+        SeedWeapon(h, 1002, d: wrong ? 5u : 1u, lockOn: locked);
+        h.Player.SetMoney(2, 100000);
+        await SendAsync(h, $"{{\"nCmd\":3,\"nGuid\":1001,\"tbGuid\":{materials}}}");
+        Assert.True(Reply(h)["nError"]!.GetValue<int>() > 0);
+        Assert.Equal(0u, target.BreakLevel);
+        Assert.Equal(100000, h.Player.GetMoney(2));
+        Assert.Contains(h.Player.Items, i => i.Guid == 1002);
+    }
+
+    [Theory]
+    [InlineData(10001, true)]
+    [InlineData(10000, false)]
+    public async Task Break_UniversalWeaponMatchesClientRarityRule(uint universalParticular, bool allowed)
+    {
+        using var h = await FeatureHarness.CreateAsync("weapon-break-universal");
+        var target = SeedWeapon(h, 1001, level: 40);
+        SeedWeapon(h, 1002, d: 2, p: universalParticular, l: 1);
+        h.Player.SetMoney(2, 100000);
+        await SendAsync(h, "{\"nCmd\":3,\"nGuid\":1001,\"tbGuid\":[[1002,1]]}");
+        Assert.Equal(allowed, Reply(h)["nError"]!.GetValue<int>() == 0);
+        Assert.Equal(allowed ? 1u : 0u, target.BreakLevel);
+        Assert.Equal(allowed, h.Player.Items.All(i => i.Guid != 1002));
+        Assert.Equal(allowed ? 80000 : 100000, h.Player.GetMoney(2));
     }
 
     // ================= nCmd 4/5：校准 =================

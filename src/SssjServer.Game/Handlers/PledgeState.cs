@@ -54,13 +54,36 @@ internal sealed class PledgeGirlState
     public int Step { get; set; } = 1;
 
     /// <summary>
-    /// 阶段卡的背包 guid。本服暂不发实体卡 ⇒ 恒 0。
-    /// ★ 客户端对它无强消费（<c>GirlPromise.lua</c> 只透传），0 是安全值。
+    /// 当前誓约奖励卡的背包 guid。首次完成阶段前为0；换模板时跟随新实例。
     /// </summary>
-    public int CardGuid { get; set; }
+    public uint CardGuid { get; set; }
+
+    /// <summary>已结算的最高阶段，客户端用于剧情按钮、最终卡面和完成状态。</summary>
+    public int RewardStep { get; set; }
 
     /// <summary>当前阶段的任务进度。</summary>
     public List<PledgeTaskState> Tasks { get; } = new();
+
+    /// <summary>第7阶段起的已领奖任务数；Lua rewardlist[step-6]，不是任务进度。</summary>
+    public List<int> RewardList { get; } = new();
+
+    internal int RewardCount(int step)
+        => step >= 7 && step - 7 < RewardList.Count ? RewardList[step - 7] : 0;
+
+    internal void SetRewardCount(int step, int count)
+    {
+        if (step < 7) throw new ArgumentOutOfRangeException(nameof(step));
+        while (RewardList.Count <= step - 7) RewardList.Add(0);
+        RewardList[step - 7] = count;
+    }
+
+    internal JsonArray BuildRewardList(int maxStep = 6)
+    {
+        var result = new JsonArray();
+        for (int i = 0; i < Math.Max(RewardList.Count, maxStep - 6); i++)
+            result.Add(i < RewardList.Count ? RewardList[i] : 0);
+        return result;
+    }
 
     public JsonObject ToJson()
     {
@@ -72,7 +95,9 @@ internal sealed class PledgeGirlState
             ["girlid"] = GirlId,
             ["step"] = Step,
             ["cardguid"] = CardGuid,
+            ["rewardstep"] = RewardStep,
             ["tasks"] = arr,
+            ["rewardlist"] = BuildRewardList(),
         };
     }
 
@@ -82,7 +107,8 @@ internal sealed class PledgeGirlState
         {
             GirlId = PledgeTaskState.ReadInt(o["girlid"]),
             Step = PledgeTaskState.ReadInt(o["step"], 1),
-            CardGuid = PledgeTaskState.ReadInt(o["cardguid"]),
+            CardGuid = o["cardguid"] is JsonValue guid && uint.TryParse(guid.ToString(), out uint id) ? id : 0,
+            RewardStep = Math.Max(0, PledgeTaskState.ReadInt(o["rewardstep"])),
         };
         if (o["tasks"] is JsonArray arr)
         {
@@ -92,6 +118,9 @@ internal sealed class PledgeGirlState
                     g.Tasks.Add(PledgeTaskState.FromJson(to));
             }
         }
+        if (o["rewardlist"] is JsonArray rewards)
+            foreach (var count in rewards)
+                g.RewardList.Add(Math.Max(0, PledgeTaskState.ReadInt(count)));
         return g;
     }
 }

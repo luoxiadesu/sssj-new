@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+﻿using System.Text.Json.Nodes;
 using SssjServer.Game.Handlers;
 using Xunit;
 
@@ -80,12 +80,10 @@ public class MiscCommandsFeatureTests
         await h.DispatchLuaCallAsync(MiscCommandsFeature.CmdCafeGirlVigor,
             """{"girlid":[1,5]}""");
 
-        foreach (uint gid in new uint[] { 1, 5 })
-        {
-            int v = h.Player.GetTask(MiscCommandsFeature.GirlVarGroup,
-                GmUnlock.GirlTaskId(gid, MiscCommandsFeature.GirlVigorOffset));
-            Assert.True(v > 0, $"少女 {gid} 的体力时间戳没落库");
-        }
+        // Unassigned girls do not recover; obsolete group-3 offset 17 is no longer written.
+        Assert.NotNull(h.Player.Extra.GetValueOrDefault(GirlMoodRecovery.ExtraKey));
+        Assert.Equal(0, h.Player.GetTask(3, GmUnlock.GirlTaskId(1, 17)));
+        Assert.NotNull(new PlayerStore(h.Options).Load(h.Player.Account));
     }
 
     /// <summary>★ <c>girlid</c> 可能是单个数字而不是数组，两种都要吃下。</summary>

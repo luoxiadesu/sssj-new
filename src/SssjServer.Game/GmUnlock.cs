@@ -534,9 +534,9 @@ public sealed class GmUnlock
             }
 
             // 衣服（服装）获得标记：group 4
-            SetTask(player, report, SuitGroup, GirlTaskId(card.D, FixModelId(card.ModelId)), OwnedNotNew);
+            SetTask(player, report, GirlTaskGroup(SuitGroup, card.D), GirlTaskId(card.D, FixModelId(card.ModelId)), OwnedNotNew);
             // 卡面获得标记：group 7
-            SetTask(player, report, CardGroup,
+            SetTask(player, report, GirlTaskGroup(CardGroup, card.D),
                     GirlTaskId(card.D, (int)(card.P * CardPStride + card.L)), OwnedNotNew);
         }
 
@@ -564,8 +564,8 @@ public sealed class GmUnlock
                 report.NoteGirl(girl);
             }
 
-            SetTask(player, report, GirlVarGroup, GirlTaskId(girlId, GirlVarIsEndShow), 1);
-            SetTask(player, report, GirlVarGroup, GirlTaskId(girlId, GirlVarSuitCount),
+            SetTask(player, report, GirlTaskGroup(GirlVarGroup, girlId), GirlTaskId(girlId, GirlVarIsEndShow), 1);
+            SetTask(player, report, GirlTaskGroup(GirlVarGroup, girlId), GirlTaskId(girlId, GirlVarSuitCount),
                     suitsByGirl[girlId].Count);
         }
 
@@ -598,7 +598,13 @@ public sealed class GmUnlock
         || (girlId > LinkGirlId && girlId <= LinkEndGirlId);
 
     /// <summary>少女相关任务值的 taskId：<c>(girlId-1) * 2000 + off</c>（GirlCommon.lua:1525）。</summary>
-    public static int GirlTaskId(uint girlId, int off) => ((int)girlId - 1) * GirlTaskStride + off;
+    public static int GirlTaskId(uint girlId, int off)
+        => ((int)(girlId > LinkGirlId && girlId <= LinkEndGirlId ? girlId - LinkGirlId : girlId) - 1) * GirlTaskStride + off;
+
+    public static int GirlTaskGroup(int group, uint girlId)
+        => girlId > LinkGirlId && girlId <= LinkEndGirlId
+            ? group switch { GirlVarGroup => 90, SuitGroup => 91, CardGroup => 92, _ => group }
+            : group;
 
     /// <summary>
     /// <c>GirlCommon:FixModelId</c> 的移植（GirlCommon.lua:609..629）：

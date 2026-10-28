@@ -200,7 +200,9 @@ public sealed class CafeFeature : IGameFeature
     public const int DayResetOffsetSeconds = 4 * 3600;
 
     private GameFeatureContext _ctx = null!;
+    private GirlMoodRecovery _mood = null!;
     private CafeTable _table = CafeTable.Empty;
+    private HouseTable _house = HouseTable.Empty;
 
     public string Name => "咖啡馆进入数据(LuaCall 112/241)";
 
@@ -215,8 +217,10 @@ public sealed class CafeFeature : IGameFeature
     public void Install(GameFeatureContext ctx)
     {
         _ctx = ctx;
+        _mood = new GirlMoodRecovery(Path.GetFullPath(ctx.Options.SettingDirectory));
         // CafeTable.Load 按目录做了进程级缓存，与 CafePetFeature 共用同一实例（见其注释）
         _table = CafeTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
+        _house = HouseTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
         ctx.MapLuaCall(ReqCafeDataCmd, OnReqCafeData);
         ctx.MapLuaCall(FurNumCmd, OnFurNum);
     }
@@ -230,13 +234,19 @@ public sealed class CafeFeature : IGameFeature
             return Task.CompletedTask;
         }
 
+        _ctx.PrepareCafeDownload(session, player);
         var now = DateTimeOffset.UtcNow;
         long baseTime = now.ToUnixTimeSeconds();
 
         var state = ReadState(player, _table);
+        // Settle elapsed recovery at the old rate before inventory-derived comfort changes it.
+        bool moodChanged = _mood.Refresh(session, player, baseTime);
+        var inventory = HouseFeature.ReadOrCreate(player, _house, session.Id);
+        state = state with { Comfort = HouseComfort.Calculate(_house, inventory, state.Level, _table.MaxComfort) };
         var content = ReadContent(player, state, _table, CafeDayIndex(now), session.Id);
-        if (WriteState(player, state, content))
-            _ctx.Store.Save(player);
+        bool cafeChanged = WriteState(player, state, content);
+        moodChanged |= _mood.Enter(session, player, baseTime);
+        if (cafeChanged || moodChanged) _ctx.Store.Save(player);
 
         var pet = CafePetState.Read(player);
         var payload = BuildCafeDataPayload(state, baseTime, pet, content);
@@ -272,7 +282,7 @@ public sealed class CafeFeature : IGameFeature
             return Task.CompletedTask;
         }
 
-        int num = FurnitureCount(player);
+        int num = FurnitureCount(player, _house);
         Log.Info($"[session {session.Id}] 咖啡馆家具数量下发 nNum={num}");
         _ctx.LuaCalls.CallClient(session, FurNumCmd, BuildFurNumPayload(num));
         return Task.CompletedTask;
@@ -286,7 +296,8 @@ public sealed class CafeFeature : IGameFeature
     /// （GameModule.cs:318）。等家园/装修功能落地后，这里改成读它那份清单即可，
     /// 两边必须是同一个数字，否则 <c>UI_CafeStore:updateCapacity()</c> 显示的容量会和实际家具数不符。
     /// </summary>
-    internal static int FurnitureCount(Player player) => 0;
+    internal static int FurnitureCount(Player player, HouseTable? table = null)
+        => table is null ? 0 : HouseFeature.ReadOrCreate(player, table).Furniture.Count;
 
     /// <summary>本地「4 点日」的日序号，与客户端 <c>GetLocalDay4AM</c>（Lib.lua:1702）同口径。</summary>
     internal static int CafeDayIndex(DateTimeOffset now)
@@ -758,12 +769,12 @@ public sealed class CafeFeature : IGameFeature
         if (storedDay == dayIndex)
         {
             weights = ReadWeights(node?["weightlist"] as JsonArray, table);
-            if (weights.Count == 0)
-                weights = RollDailyGuests(table, state.Level, player.Roleid, dayIndex);
+            if (weights.Count == 0 || weights.Any(w => !IsGuestUnlocked(table.Guests[w.Id], player, state.Level)))
+                weights = RollDailyGuests(table, state.Level, player.Roleid, dayIndex, player);
         }
         else
         {
-            weights = RollDailyGuests(table, state.Level, player.Roleid, dayIndex);
+            weights = RollDailyGuests(table, state.Level, player.Roleid, dayIndex, player);
         }
 
         return new CafeContent
@@ -855,11 +866,17 @@ public sealed class CafeFeature : IGameFeature
     /// 跨天自动换一批。**不能用 <c>HashCode.Combine</c>**：.NET 的字符串/结构哈希种子每进程随机，
     /// 服务端重启后同一天的今日顾客就变了。
     /// </summary>
+    internal static bool IsGuestUnlocked(CafeGuestRow guest, Player player, int level)
+        => guest.NeedLv <= level && (guest.NeedCoffee <= 0 ||
+            (player.GetTask(CafeBizFeature.CoffeeTaskGroup, guest.NeedCoffee) &
+                (1 << CafeBizFeature.CoffeeLearnedBit)) != 0);
+
     internal static List<CafeGuestWeight> RollDailyGuests(CafeTable table, int cafeLevel,
-                                                          ulong roleid, int dayIndex)
+                                                          ulong roleid, int dayIndex, Player? player = null)
     {
         var result = new List<CafeGuestWeight>();
-        var pool = table.GuestsUnlockedAt(cafeLevel);
+        var pool = table.GuestsUnlockedAt(cafeLevel)
+            .Where(g => player is null || IsGuestUnlocked(g, player, cafeLevel)).ToList();
         if (pool.Count == 0)
             return result;   // NCafeGuests.txt 缺失 → 只能发空清单（安全，见 BuildWeightList）
 
@@ -1030,7 +1047,7 @@ public sealed class CafeFeature : IGameFeature
         return result;
     }
 
-    private static List<IReadOnlyList<CafeAreaGirl>> ReadAreaGirls(JsonArray? arr, Player player,
+    internal static List<IReadOnlyList<CafeAreaGirl>> ReadAreaGirls(JsonArray? arr, Player player,
                                                                    CafeLevelRow? lv, int sessionId)
     {
         var result = new List<IReadOnlyList<CafeAreaGirl>>();
@@ -1046,6 +1063,7 @@ public sealed class CafeFeature : IGameFeature
             lv?.DormUnlockNum ?? 0,
         ];
 
+        var assigned = new HashSet<int>();
         for (int area = 0; area < AreaCount && area < arr.Count; area++)
         {
             if (arr[area] is not JsonArray slot)
@@ -1069,7 +1087,7 @@ public sealed class CafeFeature : IGameFeature
                     Log.Warn($"[session {sessionId}] 排班少女 girlId={girlId} 不在玩家角色卡里，丢弃");
                     continue;
                 }
-                if (limits[area] > 0 && list.Count >= limits[area])
+                if (list.Count >= Math.Max(0, limits[area]))
                 {
                     Log.Warn($"[session {sessionId}] 区域 {area + 1} 的少女数超过上限 {limits[area]}" +
                              $"（{CafeTable.LevelFileName} 的 Cafe/Rest/DormUnlockNum），多余的丢弃");
@@ -1082,6 +1100,7 @@ public sealed class CafeFeature : IGameFeature
                 //   而 `CreateGirl`（0x1D5E504）拼 prefab 路径用的是 `girlId`
                 //   （格式串 "CafeGirl{0}" @0x1D5E5FC），modelId 只参与后续换装。
                 //   所以这里既不采信客户端上传值，也不因为 0 而丢弃。
+                if (!assigned.Add(girlId)) continue;
                 list.Add(new CafeAreaGirl(girlId, (int)owned.Modelid));
             }
         }

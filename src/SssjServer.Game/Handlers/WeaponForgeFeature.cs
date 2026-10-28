@@ -84,7 +84,7 @@ namespace SssjServer.Game.Handlers;
 /// 「免费抽」与主城红点（<c>UI_Main.lua:803</c>）在池 1 上都走不到，
 /// 但免费次数仍按配置实现（换池即生效）。
 /// </summary>
-public sealed class WeaponForgeFeature : IGameFeature
+public sealed class WeaponForgeFeature : IGameFeature, IGamePulseFeature
 {
     /// <summary>与 <see cref="WeaponFeature.Function"/> 同名（协处理器挂在同一个 sFunction 上）。</summary>
     public const string Function = WeaponFeature.Function;
@@ -128,6 +128,7 @@ public sealed class WeaponForgeFeature : IGameFeature
 
     private GameFeatureContext _ctx = null!;
     private WeaponGachaTable _table = WeaponGachaTable.Empty;
+    private GachaRequestLimits _requestLimits = null!;
     private readonly Random _rng = new();
 
     public string Name => "武器抽卡（WeaponLogicMsg nCmd=0「武器补给/打造」）";
@@ -136,6 +137,12 @@ public sealed class WeaponForgeFeature : IGameFeature
     {
         _ctx = ctx;
         _table = WeaponGachaTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
+        _requestLimits = new GachaRequestLimits(Path.GetFullPath(ctx.Options.SettingDirectory));
+        ctx.OnPlayerPrepare((session, player) =>
+        {
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            if (GachaFreeDraws.RefreshWeapons(player, _table.OpenAt(now), now, [])) ctx.Store.Save(player);
+        });
         // ★ 协处理器，不抢 MapFunction（见类注释）
         ctx.AddFunctionCoHandler(Function, OnCommand);
     }
@@ -152,15 +159,24 @@ public sealed class WeaponForgeFeature : IGameFeature
 
         if (ReadInt(obj["nCmd"], -1) != CmdForge)
             return Task.FromResult(false);
+        if (!GachaRequestLimits.TryInteger(obj["nCmd"], out int cmd) || cmd != CmdForge)
+        {
+            Fail(session, ErrGeneric);
+            return Task.FromResult(true);
+        }
 
-        Forge(session, player, obj);
+        lock(player) Forge(session, player, obj);
         return Task.FromResult(true);
     }
 
     private void Forge(ClientSession session, Player player, JsonObject param)
     {
-        int poolId = ReadInt(param["Id"], -1);
-        bool ten = ReadBool(param["isTen"]);
+        if (!GachaRequestLimits.TryInteger(param["Id"], out int poolId) || poolId <= 0
+            || !GachaRequestLimits.TryMode(param["isTen"], out bool ten))
+        {
+            Fail(session, ErrGeneric);
+            return;
+        }
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
         // ---- ① 池子存在性与档期 ----
@@ -193,8 +209,23 @@ public sealed class WeaponForgeFeature : IGameFeature
         }
 
         int draws = ten ? TenCount : 1;
+        if (!_requestLimits.HasRoom(player, WeaponGenre, draws))
+        {
+            Fail(session, 20082);
+            return;
+        }
+        int operationKey = ten ? 10004 : 10003;
+        if (player.GetTask(TaskGroup, operationKey) == int.MaxValue ||
+            player.GetTask(TaskGroup, 1001) > int.MaxValue - draws ||
+            player.GetTask(TaskGroup, TaskProtectBeginWeapon + pool.Id) > int.MaxValue - draws)
+        {
+            Fail(session, ErrGeneric);
+            return;
+        }
+        RefreshFreeState(session, player, now);
 
         // ---- ② 扣费（免费次数优先，其次道具，其次免费钻石）----
+        var paymentBefore = new GachaPaymentSnapshot(player);
         var spend = TrySpend(player, pool, ten, now);
         if (!spend.Ok)
         {
@@ -202,6 +233,8 @@ public sealed class WeaponForgeFeature : IGameFeature
             Fail(session, ErrGeneric);
             return;
         }
+
+        var payment = paymentBefore.After(player);
 
         // ---- ③ 抽取 ----
         var seed = _table.GetSeed(pool.CardStarSeedId);
@@ -218,7 +251,13 @@ public sealed class WeaponForgeFeature : IGameFeature
                 RewardSource.Extra, granted);
         }
 
+        player.SetTask(TaskGroup, 1001, player.GetTask(TaskGroup, 1001) + draws);
+        player.SetTask(TaskGroup, operationKey, player.GetTask(TaskGroup, operationKey) + 1);
+        var history = GachaHistory.Append(player,0,pool.Id,now,
+            results.Select(r=>new[]{r.Entry.G,r.Entry.D,r.Entry.P,r.Entry.L}),payment);
         _ctx.Store.Save(player);
+
+        GachaHistory.Push(session,0,history);
 
         // ---- ⑤ 推送：★★★ 必须在回包之前（客户端要按 nGuid 读本地缓存）----
         GameNotify.PushMoney(session, player, spend.ChangedMoney);
@@ -359,7 +398,7 @@ public sealed class WeaponForgeFeature : IGameFeature
     // =================================================================
 
     /// <summary>扣费结果。</summary>
-    private sealed class SpendResult
+    internal sealed class SpendResult
     {
         public bool Ok { get; set; }
         public string Reason { get; set; } = "";
@@ -386,7 +425,7 @@ public sealed class WeaponForgeFeature : IGameFeature
     ///     `UI_WeaponSystemNEW.lua:723` 算的 rate）。</item>
     /// </list>
     /// </summary>
-    private SpendResult TrySpend(Player player, WeaponGachaPool pool, bool ten, long now)
+    internal SpendResult TrySpend(Player player, WeaponGachaPool pool, bool ten, long now)
     {
         var r = new SpendResult();
 
@@ -527,6 +566,8 @@ public sealed class WeaponForgeFeature : IGameFeature
         int protectKey = TaskProtectBeginWeapon + pool.Id;
         yield return new(Player.ComposeTaskId(TaskGroup, protectKey),
                          player.GetTask(TaskGroup, protectKey));
+        foreach (int key in new[] { 1001, 10003, 10004 })
+            yield return new(Player.ComposeTaskId(TaskGroup, key), player.GetTask(TaskGroup, key));
     }
 
     /// <summary>成功回包（带 tbParam）。</summary>
@@ -548,6 +589,16 @@ public sealed class WeaponForgeFeature : IGameFeature
 
     private static int ReadInt(JsonNode? node, int fallback = 0)
         => node is null ? fallback : int.TryParse(node.ToString(), out var v) ? v : fallback;
+
+    private void RefreshFreeState(ClientSession session, Player player, long now)
+    {
+        var tasks = new List<KeyValuePair<uint, int>>();
+        if (GachaFreeDraws.RefreshWeapons(player, _table.OpenAt(now), now, tasks)) _ctx.Store.Save(player);
+        if (tasks.Count > 0) GameNotify.PushTaskValues(session, tasks);
+    }
+
+    void IGamePulseFeature.OnPlayerPulse(ClientSession session, Player player)
+        => RefreshFreeState(session, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
 
     /// <summary>读 bool；Lua/JSON 侧可能给 true/false 或 0/1。</summary>
     private static bool ReadBool(JsonNode? node)

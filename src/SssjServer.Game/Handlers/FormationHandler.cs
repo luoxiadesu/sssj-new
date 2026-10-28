@@ -52,8 +52,15 @@ public sealed class FormationHandler
             return Task.CompletedTask;
         }
 
-        uint id = (uint)ReadInt(param?["Id"], 1);
-        var slots = ParseSlots(param?["Info"]);
+        // Validate the entire update before touching the existing formation.
+        // An explicit [] clears it; missing/malformed Info must not erase a team.
+        if (param is not JsonObject request || !TryReadGuid(request["Id"], out uint id)
+            || id == 0 || !TryParseSlots(request["Info"], out var slots))
+        {
+            Log.Warn($"[session {session.Id}] 编队保存参数无效，保留原编队");
+            _luaCalls.CallClient(session, cmd, new { ret = 1 });
+            return Task.CompletedTask;
+        }
 
         var formation = player.Formations.FirstOrDefault(f => f.Id == id);
         if (formation is null)
@@ -108,7 +115,11 @@ public sealed class FormationHandler
     /// <summary>把 Player.Formation 转成 proto 的 FormationInfo（含副卡/武器/符文槽）。</summary>
     public static FormationInfo BuildFormationInfo(Formation formation)
     {
-        var fi = new FormationInfo { Id = formation.Id, Title = formation.Title };
+        var fi = new FormationInfo
+        {
+            Id = formation.Id,
+            Title = string.IsNullOrWhiteSpace(formation.Title) ? $"队伍 {formation.Id}" : formation.Title,
+        };
         foreach (var slot in formation.Slots)
         {
             var card = new FightCard
@@ -129,29 +140,46 @@ public sealed class FormationHandler
     /// <summary>解析上行 Info 数组为编队槽位。</summary>
     internal static List<FormationCardSlot> ParseSlots(JsonNode? info)
     {
-        var result = new List<FormationCardSlot>();
-        if (info is not JsonArray arr)
-            return result;
+        return TryParseSlots(info, out var slots) ? slots : new();
+    }
 
+    private static bool TryParseSlots(JsonNode? info, out List<FormationCardSlot> result)
+    {
+        result = new();
+        if (info is not JsonArray arr) return false;
         foreach (var node in arr)
         {
-            if (node is null)
-                continue;
+            if (node is not JsonObject obj
+                || !TryReadGuid(obj["MainCard"], out uint main)
+                || !TryReadGuid(obj["UsedCard"], out uint used)
+                || !TryReadGuid(obj["WeaponId"], out uint weapon)) return false;
             var slot = new FormationCardSlot
             {
-                MainCardGuid = (uint)ReadInt(node["MainCard"], 0),
-                UsedCardGuid = (uint)ReadInt(node["UsedCard"], 0),
-                WeaponGuid = (uint)ReadInt(node["WeaponId"], 0),
+                MainCardGuid = main, UsedCardGuid = used, WeaponGuid = weapon,
             };
-            if (node["Secondarycard"] is JsonArray sec)
-                foreach (var s in sec)
-                    slot.SecondaryCardGuids.Add((uint)ReadInt(s, 0));
-            if (node["Rune"] is JsonArray runes)
-                foreach (var r in runes)
-                    slot.RuneItems.Add((uint)ReadInt(r, 0));
+            if (!TryReadGuidList(obj["Secondarycard"], slot.SecondaryCardGuids)
+                || !TryReadGuidList(obj["Rune"], slot.RuneItems)) return false;
             result.Add(slot);
         }
-        return result;
+        return true;
+    }
+
+    private static bool TryReadGuidList(JsonNode? node, List<uint> values)
+    {
+        if (node is null) return true;
+        if (node is not JsonArray array) return false;
+        foreach (var entry in array)
+        {
+            if (!TryReadGuid(entry, out uint value)) return false;
+            values.Add(value);
+        }
+        return true;
+    }
+
+    private static bool TryReadGuid(JsonNode? node, out uint value)
+    {
+        value = 0;
+        return node is null || (node is JsonValue && uint.TryParse(node.ToString(), out value));
     }
 
     private static int ReadInt(JsonNode? node, int fallback)

@@ -17,6 +17,23 @@ namespace SssjServer.Game.Tests;
 /// </summary>
 public class MailFeatureTests
 {
+    [Fact]
+    public void ProducerMailPersistsOnceAndDoesNotReturnAfterDeletion()
+    {
+        var p = new Player("producer-test", 1);
+        var mails = new List<MailEntry> { Sample(12) };
+        Assert.True(MailFeature.EnsureProducerMail(p, mails));
+        Assert.Equal(13, mails.Last().Id);
+        Assert.Equal("制作人：SteveS，勿擅自转发", mails.Last().Content);
+        Assert.Empty(mails.Last().Items);
+        MailFeature.Save(p, mails);
+        var loaded = MailFeature.Load(p);
+        Assert.False(MailFeature.EnsureProducerMail(p, loaded));
+        loaded.RemoveAll(m => m.Sender == "SteveS");
+        MailFeature.Save(p, loaded);
+        Assert.False(MailFeature.EnsureProducerMail(p, MailFeature.Load(p)));
+        Assert.Single(MailFeature.Load(p));
+    }
     private static MailEntry Sample(int id = 7, bool withItems = true, bool taken = false) => new()
     {
         Id = id,

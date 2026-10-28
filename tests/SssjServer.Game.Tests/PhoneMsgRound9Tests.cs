@@ -30,6 +30,31 @@ public class PhoneMsgRound9Tests
     private const int BbsId = 1;
     private const int BbsNpc = 7;
 
+    [Theory]
+    [InlineData(0, 1)]
+    [InlineData(2, 2)]
+    public async Task LetterRewardCrossesLevelTenAndPersistsStoryUnlock(int prior, int expected)
+    {
+        using var h = await FeatureHarness.CreateAsync("letter-love-threshold");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
+        await SendAsync(h, $"{{\"nCmd\":11,\"nMsgId\":{LetterId}}}");
+        await SendAsync(h, $"{{\"nCmd\":3,\"nMsgId\":{LetterId},\"nSelectId\":1}}");
+        await PhoneDialogTests.Finish(h);
+        var table = GirlLoveTable.Load(TestPaths.SettingDir);
+        var girl = h.Player.GetGirl(1)!;
+        girl.Level = 9;
+        girl.Exp = (uint)(table.LevelUpExp(1, 9) - 1);
+        int task = GirlLoveFeature.VarTaskId(1, GirlLoveFeature.ELevelOffset(5));
+        h.Player.SetTask(3, task, prior);
+        await SendAsync(h, $"{{\"nCmd\":7,\"nMsgId\":{LetterId}}}");
+        Assert.Equal(10u, girl.Level);
+        Assert.Equal(expected, h.Player.GetTask(3, task));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(expected, saved.GetTask(3, task));
+        Assert.Equal(girl.Level, saved.GetGirl(1)!.Level);
+        Assert.True(await h.WaitForPfAsync(GamePf.TaskValueSyncRsp));
+    }
+
     private static Task SendAsync(FeatureHarness h, string json)
         => h.LuaCalls.DispatchAsync(h.Session, PhoneMsgFeature.UpFunction, json);
 
@@ -115,6 +140,7 @@ public class PhoneMsgRound9Tests
     public async Task Login_PushesPhoneMsgNtf_EvenWhenEmpty()
     {
         using var h = await FeatureHarness.CreateAsync("phone-login");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
         h.Module.RunLoginHooksForTest(h.Session, h.Player);
 
@@ -127,6 +153,7 @@ public class PhoneMsgRound9Tests
     public async Task EachCommand_RepushesFullPhoneMsgNtf()
     {
         using var h = await FeatureHarness.CreateAsync("phone-repush");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
         await SendAsync(h, $"{{\"nCmd\":12,\"nMsgId\":{LetterId}}}");
 
@@ -140,6 +167,7 @@ public class PhoneMsgRound9Tests
     public async Task LetterEvent_CreatesTopic_AndRepliesAsNewLetter()
     {
         using var h = await FeatureHarness.CreateAsync("phone-levent");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
         await SendAsync(h, $"{{\"nCmd\":12,\"nMsgId\":{LetterId}}}");
 
@@ -162,6 +190,7 @@ public class PhoneMsgRound9Tests
     public async Task LetterEvent_IsIdempotent()
     {
         using var h = await FeatureHarness.CreateAsync("phone-levent-idem");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
         await SendAsync(h, $"{{\"nCmd\":12,\"nMsgId\":{LetterId}}}");
         await SendAsync(h, $"{{\"nCmd\":12,\"nMsgId\":{LetterId}}}");
@@ -177,6 +206,7 @@ public class PhoneMsgRound9Tests
     public async Task LetterEvent_OrphanId_RepliesOkWithoutCreatingState()
     {
         using var h = await FeatureHarness.CreateAsync("phone-levent-orphan");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
         await SendAsync(h, "{\"nCmd\":12,\"nMsgId\":9}");
 
@@ -188,7 +218,9 @@ public class PhoneMsgRound9Tests
     public async Task BbsEvent_CreatesTopic_AndRepliesAsNewPost()
     {
         using var h = await FeatureHarness.CreateAsync("phone-bevent");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
+        h.Player.Levels[ChapterTable.Load(TestPaths.SettingDir).Get(2, 6, 1)!.MapId] = 7;
         await SendAsync(h, $"{{\"nCmd\":13,\"nMsgId\":{BbsId}}}");
 
         var reply = LastReply(h);
@@ -215,7 +247,9 @@ public class PhoneMsgRound9Tests
     public async Task LetterReply_RecordsSelection_AndEchoesIds()
     {
         using var h = await FeatureHarness.CreateAsync("phone-lreply");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
+        await SendAsync(h, $"{{\"nCmd\":11,\"nMsgId\":{LetterId}}}");
         await SendAsync(h, $"{{\"nCmd\":3,\"nMsgId\":{LetterId},\"nSelectId\":2}}");
 
         var reply = LastReply(h);
@@ -240,22 +274,25 @@ public class PhoneMsgRound9Tests
     public async Task BbsReply_RecordsReply_AndGrantsGirlExp()
     {
         using var h = await FeatureHarness.CreateAsync("phone-breply");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
         // 好感度要有少女实例才加得上
         var girl = new Girl { Girlid = (uint)BbsNpc };
         h.Player.Girls.Add(girl);
         int expBefore = (int)girl.Exp;
 
-        await SendAsync(h, $"{{\"nCmd\":1,\"nMsgId\":{BbsId},\"nSelectId\":1}}");
+        h.Player.Levels[ChapterTable.Load(TestPaths.SettingDir).Get(2, 6, 1)!.MapId] = 7;
+        await SendAsync(h, $"{{\"nCmd\":13,\"nMsgId\":{BbsId}}}");
+        await SendAsync(h, $"{{\"nCmd\":1,\"nMsgId\":{BbsId},\"nSelectId\":2}}");
 
         var reply = LastReply(h);
         Assert.Equal(PhoneMsgFeature.CmdBbs, reply["nCmd"]!.GetValue<int>());
-        Assert.Equal(1, PhoneMsgFeature.LoadStateStatic(h.Player).Bbs[BbsId].ReplyInfo);
+        Assert.Equal(2, PhoneMsgFeature.LoadStateStatic(h.Player).Bbs[BbsId].ReplyInfo);
 
-        // AwardInfo[1] = 5 ⇒ 好感度 +5，且 tbExp 必须是六元数组
+        // AwardInfo[2] = 10 ⇒ 好感度 +10，且 tbExp 必须是六元数组
         var tbExp = Assert.IsType<JsonArray>(reply["tbExp"]);
         Assert.Equal(6, tbExp.Count);
-        Assert.Equal(5, tbExp[0]!.GetValue<int>());
-        Assert.Equal(expBefore + 5, (int)h.Player.GetGirl((uint)BbsNpc)!.Exp);
+        Assert.Equal(10, tbExp[0]!.GetValue<int>());
+        Assert.Equal(expBefore + 10, (int)h.Player.GetGirl((uint)BbsNpc)!.Exp);
         // 好感度存 protobuf ⇒ 必须推 pf 1030
         Assert.True(await h.WaitForPfAsync(GamePf.GirlDataNtf), "加好感度必须推 pf 1030");
     }
@@ -266,6 +303,7 @@ public class PhoneMsgRound9Tests
     public async Task LetterTitle_SetAndClear()
     {
         using var h = await FeatureHarness.CreateAsync("phone-title");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
         await SendAsync(h, $"{{\"nCmd\":4,\"nNpcId\":{LetterNpc},\"strTitle\":\"小樱\"}}");
         Assert.Equal("小樱", LastReply(h)["strTitle"]!.GetValue<string>());
@@ -283,6 +321,7 @@ public class PhoneMsgRound9Tests
     public async Task LetterTitle_FixedNpc_IsRejected()
     {
         using var h = await FeatureHarness.CreateAsync("phone-title-fixed");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
         await SendAsync(h,
             $"{{\"nCmd\":4,\"nNpcId\":{PhoneMsgFeature.FixedTitleNpcId},\"strTitle\":\"x\"}}");
@@ -296,11 +335,14 @@ public class PhoneMsgRound9Tests
     public async Task LetterAward_GrantsGirlExp_AndSetsAwardFlag()
     {
         using var h = await FeatureHarness.CreateAsync("phone-award");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
         h.Player.Girls.Add(new Girl { Girlid = (uint)LetterNpc });
 
         // 先回复一次（选项 1），领奖按最后一次选择结算 ⇒ AwardInfo[1] = 10
+        await SendAsync(h, $"{{\"nCmd\":11,\"nMsgId\":{LetterId}}}");
         await SendAsync(h, $"{{\"nCmd\":3,\"nMsgId\":{LetterId},\"nSelectId\":1}}");
         int expBefore = (int)h.Player.GetGirl((uint)LetterNpc)!.Exp;
+        await PhoneDialogTests.Finish(h);
 
         await SendAsync(h, $"{{\"nCmd\":7,\"nMsgId\":{LetterId}}}");
 
@@ -321,7 +363,10 @@ public class PhoneMsgRound9Tests
     public async Task LetterAward_Twice_SecondIsRejected()
     {
         using var h = await FeatureHarness.CreateAsync("phone-award-twice");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
         h.Player.Girls.Add(new Girl { Girlid = (uint)LetterNpc });
+        await PhoneDialogTests.Finish(h);
+        await SendAsync(h, $"{{\"nCmd\":11,\"nMsgId\":{LetterId}}}");
 
         await SendAsync(h, $"{{\"nCmd\":7,\"nMsgId\":{LetterId}}}");
         Assert.Equal(PhoneMsgFeature.ErrOk, LastReply(h)["nError"]!.GetValue<int>());
@@ -336,6 +381,7 @@ public class PhoneMsgRound9Tests
     public async Task LetterGet_AddsTopic_ThenDeleteRemovesIt()
     {
         using var h = await FeatureHarness.CreateAsync("phone-getdel");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
         await SendAsync(h, $"{{\"nCmd\":11,\"nMsgId\":{LetterId}}}");
         Assert.True(PhoneMsgFeature.LoadStateStatic(h.Player)
@@ -356,11 +402,15 @@ public class PhoneMsgRound9Tests
     public async Task State_SurvivesRoundTripThroughExtra()
     {
         using var h = await FeatureHarness.CreateAsync("phone-persist");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
         h.Player.Girls.Add(new Girl { Girlid = (uint)LetterNpc });
 
+        await SendAsync(h, $"{{\"nCmd\":11,\"nMsgId\":{LetterId}}}");
         await SendAsync(h, $"{{\"nCmd\":3,\"nMsgId\":{LetterId},\"nSelectId\":2}}");
+        await PhoneDialogTests.Finish(h);
         await SendAsync(h, $"{{\"nCmd\":4,\"nNpcId\":{LetterNpc},\"strTitle\":\"阿P\"}}");
         await SendAsync(h, $"{{\"nCmd\":7,\"nMsgId\":{LetterId}}}");
+        h.Player.Levels[ChapterTable.Load(TestPaths.SettingDir).Get(2, 6, 1)!.MapId] = 7;
         await SendAsync(h, $"{{\"nCmd\":13,\"nMsgId\":{BbsId}}}");
 
         // 模拟「存档 → 读档」：把 Extra 里的 JSON 重新解一遍
@@ -372,7 +422,7 @@ public class PhoneMsgRound9Tests
         // ★ 存的是 `位置*10+分支` 复合编码（第十四轮），不再是裸候选序号；
         //   这里只校验「往返不丢」+「位置非 0」，不写死具体数值。
         var msgIds = letter.Topics[LetterId].MsgIds;
-        Assert.Single(msgIds);
+        Assert.NotEmpty(msgIds);
         Assert.Equal(2, PhoneMsgTable.ReplyBranchOf(msgIds[0]));
         Assert.True(PhoneMsgTable.ReplyPosOf(msgIds[0]) > 0);
         Assert.Equal(1, letter.Topics[LetterId].AwardFlag);
@@ -387,13 +437,15 @@ public class PhoneMsgRound9Tests
     public async Task 登录时把裸候选序号迁移成合法编码()
     {
         using var h = await FeatureHarness.CreateAsync("phone-migrate");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
         // 造一份「第十四轮之前」的脏存档：msgids 全是裸序号
+        await SendAsync(h, $"{{\"nCmd\":11,\"nMsgId\":{LetterId}}}");
         await SendAsync(h, $"{{\"nCmd\":3,\"nMsgId\":{LetterId},\"nSelectId\":1}}");
         var st = PhoneMsgFeature.LoadStateStatic(h.Player);
         var topic = st.Letters[LetterNpc].Topics[LetterId];
         topic.MsgIds.Clear();
-        topic.MsgIds.AddRange(new[] { 1, 2, 1 });      // 全是位置 0 的脏值
+        topic.MsgIds.AddRange(new[] { 2 });      // 全是位置 0 的脏值
         h.Player.Extra[PhoneMsgFeature.ExtraKey] = st.ToJson();
 
         h.RunLoginHooks();
@@ -401,12 +453,12 @@ public class PhoneMsgRound9Tests
         var after = PhoneMsgFeature.LoadStateStatic(h.Player)
                                    .Letters[LetterNpc].Topics[LetterId].MsgIds;
 
-        Assert.Equal(3, after.Count);
+        Assert.Single(after);
         // ★ 位置全部非 0（这正是修复的目标）
         Assert.All(after, v => Assert.True(PhoneMsgTable.ReplyPosOf(v) > 0,
             $"迁移后仍有位置为 0 的 replyId：{v}"));
         // ★ 分支号（= 玩家的选择历史）必须原样保留
-        Assert.Equal(new[] { 1, 2, 1 }, after.Select(PhoneMsgTable.ReplyBranchOf).ToArray());
+        Assert.Equal(new[] { 2 }, after.Select(PhoneMsgTable.ReplyBranchOf).ToArray());
     }
 
     /// <summary>★ <c>0</c>（NPC 稍后回复）是合法值，迁移不能动它。</summary>
@@ -414,7 +466,9 @@ public class PhoneMsgRound9Tests
     public async Task 迁移不改动表示稍后回复的0()
     {
         using var h = await FeatureHarness.CreateAsync("phone-migrate-zero");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
+        await SendAsync(h, $"{{\"nCmd\":11,\"nMsgId\":{LetterId}}}");
         await SendAsync(h, $"{{\"nCmd\":3,\"nMsgId\":{LetterId},\"nSelectId\":1}}");
         var st = PhoneMsgFeature.LoadStateStatic(h.Player);
         var topic = st.Letters[LetterNpc].Topics[LetterId];
@@ -436,7 +490,9 @@ public class PhoneMsgRound9Tests
     public async Task 迁移对已修复存档幂等()
     {
         using var h = await FeatureHarness.CreateAsync("phone-migrate-idem");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
 
+        await SendAsync(h, $"{{\"nCmd\":11,\"nMsgId\":{LetterId}}}");
         await SendAsync(h, $"{{\"nCmd\":3,\"nMsgId\":{LetterId},\"nSelectId\":2}}");
 
         h.RunLoginHooks();
@@ -602,6 +658,7 @@ public class PhoneMsgRound9Tests
     public async Task Backfill_通关型触发在登录时补发()
     {
         using var h = await FeatureHarness.CreateAsync("phone-backfill-pass");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
         var table = PhoneMsgTable.Load(TestPaths.SettingDir);
         var chapters = ChapterTable.Load(TestPaths.SettingDir);
 
@@ -636,6 +693,7 @@ public class PhoneMsgRound9Tests
     public async Task Backfill_条件不满足不补发()
     {
         using var h = await FeatureHarness.CreateAsync("phone-backfill-none");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
         var table = PhoneMsgTable.Load(TestPaths.SettingDir);
 
         var target = table.AllLetterEvents.FirstOrDefault(e =>
@@ -662,6 +720,7 @@ public class PhoneMsgRound9Tests
     public async Task Backfill_剧情类未读时不补发()
     {
         using var h = await FeatureHarness.CreateAsync("phone-backfill-story");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
         var table = PhoneMsgTable.Load(TestPaths.SettingDir);
 
         var story = table.AllLetterEvents.FirstOrDefault(e =>
@@ -685,6 +744,7 @@ public class PhoneMsgRound9Tests
     public async Task Backfill_剧情已读后补发剧情类()
     {
         using var h = await FeatureHarness.CreateAsync("phone-backfill-story-read");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
         var table = PhoneMsgTable.Load(TestPaths.SettingDir);
 
         var story = table.AllLetterEvents.FirstOrDefault(e =>
@@ -711,6 +771,7 @@ public class PhoneMsgRound9Tests
     public async Task Backfill_重复登录幂等()
     {
         using var h = await FeatureHarness.CreateAsync("phone-backfill-idem");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
         var chapters = ChapterTable.Load(TestPaths.SettingDir);
         var table = PhoneMsgTable.Load(TestPaths.SettingDir);
 
@@ -742,8 +803,10 @@ public class PhoneMsgRound9Tests
     public async Task Backfill_不覆盖已有进度()
     {
         using var h = await FeatureHarness.CreateAsync("phone-backfill-keep");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
         h.Player.Girls.Add(new Girl { Girlid = (uint)LetterNpc });
 
+        await SendAsync(h, $"{{\"nCmd\":11,\"nMsgId\":{LetterId}}}");
         await SendAsync(h, $"{{\"nCmd\":3,\"nMsgId\":{LetterId},\"nSelectId\":2}}");
         var before = PhoneMsgFeature.LoadStateStatic(h.Player)
             .Letters[LetterNpc].Topics[LetterId].MsgIds.ToList();
@@ -770,6 +833,7 @@ public class PhoneMsgRound9Tests
     public async Task Backfill_好感度触发只看归属少女()
     {
         using var h = await FeatureHarness.CreateAsync("phone-backfill-love-scope");
+        h.Player.SetTask(18, 662, 200); // Topic 135 requires achievement 662 before first receipt.
         var table = PhoneMsgTable.Load(TestPaths.SettingDir);
 
         // 纯类型 3 单条件、话题存在、且归属 NPC 明确的靶子

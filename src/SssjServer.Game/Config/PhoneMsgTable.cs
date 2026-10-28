@@ -116,6 +116,7 @@ public sealed class BbsTopic
     /// 决定红点（<c>PhoneMsgLogic:CheckBBSReply</c>，<c>:1827</c>）。
     /// </summary>
     public int ReplyIdx { get; init; }
+    public IReadOnlyList<string> PlayerOptions { get; init; } = Array.Empty<string>();
 
     /// <summary>回复档数（<c>ReplyId1..N</c> 里实际有值的个数）。</summary>
     public int ReplyCount { get; init; }
@@ -376,6 +377,7 @@ public sealed class PhoneMsgTable
                     NpcId = bbsRaw.Int(row, "NpcId", 0),
                     AwardExp = ParseCommaInts(bbsRaw.Str(row, "AwardInfo")),
                     ReplyIdx = replyIdx,
+                    PlayerOptions = replyIdx > 0 ? ParseCommaStrings(bbsRaw.Str(row, $"ReplyInfo{replyIdx}")) : Array.Empty<string>(),
                     ReplyCount = replyCount,
                 };
             }

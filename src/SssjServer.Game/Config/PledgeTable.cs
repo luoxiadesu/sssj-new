@@ -24,6 +24,8 @@ public sealed class PledgeStepRow
     /// <summary>是否更换卡片（<c>changecard</c>）。</summary>
     public int ChangeCard { get; init; }
 
+    public string SimpleCartoon { get; init; } = "";
+
     /// <summary>本阶段发放的卡片四元组（<c>cardgdpl</c>，**短横**分隔）。</summary>
     public IReadOnlyList<int> CardGdpl { get; init; } = Array.Empty<int>();
 
@@ -44,6 +46,9 @@ public sealed class PledgeStepRow
     /// 全部完成后才能 <c>Pldge_StepUpGirl</c> 进下一阶段。
     /// </summary>
     public IReadOnlyList<int> TaskList { get; init; } = Array.Empty<int>();
+
+    /// <summary>第7阶段奖励：G-D-P-L-N-完成任务数；第6位不是概率或卡片等级。</summary>
+    public IReadOnlyList<int[]> Rewards { get; init; } = Array.Empty<int[]>();
 
     /// <summary>
     /// ★★★ <c>isopen</c> 列 —— <b>不是 0/1 布尔，是「开放日期」字符串</b>
@@ -203,6 +208,8 @@ public sealed class PledgeTable
     /// <summary>少女数（有 step 配置的）。</summary>
     public int GirlCount => _steps.Count;
 
+    public bool IsSimple(int girlId) => Step(girlId, 0)?.SimpleCartoon == "1";
+
     /// <summary>阶段行总数。</summary>
     public int StepCount => _steps.Values.Sum(d => d.Count);
 
@@ -304,12 +311,14 @@ public sealed class PledgeTable
                 GirlId = gid,
                 Step = stepRaw.Int(row, "step"),
                 ChangeCard = stepRaw.Int(row, "changecard"),
+                SimpleCartoon = stepRaw.Str(row, "SimpleCartoon"),
                 CardGdpl = ParseDashInts(stepRaw.Str(row, "cardgdpl")),
                 CardBreakLv = stepRaw.Int(row, "cardbreaklv"),
                 CardLv = stepRaw.Int(row, "cardlv"),
                 CardSkillLv = ParseDashInts(stepRaw.Str(row, "cardskilllv")),
                 Heart = stepRaw.Int(row, "heart"),
                 TaskList = ParseDashInts(stepRaw.Str(row, "tasklist")),
+                Rewards = ParseRewards(stepRaw.Str(row, "rewards")),
                 OpenTimeRaw = stepRaw.Str(row, "isopen"),
             };
             if (!table._steps.TryGetValue(gid, out var d))
@@ -326,10 +335,24 @@ public sealed class PledgeTable
     }
 
     /// <summary>
-    /// **短横**分隔的整数数组（<c>Parse2Item(x, "-")</c>）。
-    /// ★ AGENTS.md §5 记载过「同表两个 INTARR 列分隔符可能不同」的坑：
-    /// 本表的 <c>cardgdpl</c>/<c>cardskilllv</c>/<c>tasklist</c> 都是短横，已逐列核对。
+    /// 逗号分隔奖励条目，每条内部用短横分隔；保留坏条目以便领取时整批拒绝。
     /// </summary>
+    internal static IReadOnlyList<int[]> ParseRewards(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return Array.Empty<int[]>();
+        // Preserve invalid tuples as empty entries so claims reject the entire
+        // configuration instead of advancing the watermark past a missing reward.
+        return value.Split(',').Select(tuple =>
+        {
+            var parts = tuple.Trim().Split('-');
+            var numbers = new int[parts.Length];
+            for (int i = 0; i < parts.Length; i++)
+                if (!int.TryParse(parts[i].Trim(), out numbers[i])) return Array.Empty<int>();
+            return numbers;
+        }).ToArray();
+    }
+
+    /// <summary>cardgdpl/cardskilllv/tasklist 使用短横分隔，与 rewards 的外层逗号不同。</summary>
     internal static int[] ParseDashInts(string value)
     {
         if (string.IsNullOrWhiteSpace(value))

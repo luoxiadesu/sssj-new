@@ -171,6 +171,11 @@ public sealed class PhoneState
 
     /// <summary>可发表帖子 id 列表（nCmd 8 下发、nCmd 9 追加、发帖后移除）。</summary>
     public List<int> BbsApply { get; } = new();
+    public Dictionary<int, TopicState> ArchivedTopics { get; } = new();
+    public HashSet<int> DeletedLetters { get; } = new();
+    public HashSet<int> ReceivedLetters { get; } = new();
+    public HashSet<int> CompletedLetters { get; } = new();
+    public HashSet<int> ClaimedLetters { get; } = new();
 
     public JsonObject ToJson()
     {
@@ -189,6 +194,11 @@ public sealed class PhoneState
         return new JsonObject
         {
             ["letters"] = letters,
+            ["archivedTopics"] = new JsonArray(ArchivedTopics.Values.OrderBy(t => t.TopicId).Select(t => (JsonNode?)t.ToJson()).ToArray()),
+            ["deletedLetters"] = new JsonArray(DeletedLetters.Order().Select(id => (JsonNode?)JsonValue.Create(id)).ToArray()),
+            ["receivedLetters"] = new JsonArray(ReceivedLetters.Order().Select(id => (JsonNode?)JsonValue.Create(id)).ToArray()),
+            ["completedLetters"] = new JsonArray(CompletedLetters.Order().Select(id => (JsonNode?)JsonValue.Create(id)).ToArray()),
+            ["claimedLetters"] = new JsonArray(ClaimedLetters.Order().Select(id => (JsonNode?)JsonValue.Create(id)).ToArray()),
             ["bbs"] = bbs,
             [PhoneMsgFeature.BbsApplyField] = apply,
         };
@@ -199,6 +209,20 @@ public sealed class PhoneState
         var s = new PhoneState();
         if (o is null)
             return s;
+        if (o["archivedTopics"] is JsonArray archived)
+            foreach (var node in archived)
+                if (node is JsonObject entry)
+                {
+                    var topic = TopicState.FromJson(entry);
+                    if (topic.TopicId > 0) s.ArchivedTopics[topic.TopicId] = topic;
+                }
+        foreach (var (key, target) in new[] { ("deletedLetters", s.DeletedLetters), ("receivedLetters", s.ReceivedLetters), ("completedLetters", s.CompletedLetters) })
+            if (o[key] is JsonArray history)
+                foreach (var value in history)
+                    if (PhoneMsgFeature.JsonInt(value) is > 0 and var id) target.Add(id);
+        if (o["claimedLetters"] is JsonArray claimed)
+            foreach (var value in claimed)
+                if (PhoneMsgFeature.JsonInt(value) is > 0 and var id) s.ClaimedLetters.Add(id);
 
         if (o["letters"] is JsonArray la)
         {
@@ -208,6 +232,9 @@ public sealed class PhoneState
                     continue;
                 var l = LetterState.FromJson(lo);
                 s.Letters[l.NpcId] = l;
+                s.ReceivedLetters.UnionWith(l.Topics.Keys);
+                foreach (var topic in l.Topics.Values.Where(t => t.AwardFlag > 0))
+                    s.ClaimedLetters.Add(topic.TopicId);
             }
         }
         if (o["bbs"] is JsonArray ba)

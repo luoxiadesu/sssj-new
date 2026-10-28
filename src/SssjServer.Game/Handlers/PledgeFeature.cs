@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using SssjServer.Core;
 using SssjServer.Game.Config;
@@ -66,18 +67,17 @@ namespace SssjServer.Game.Handlers;
 ///   <item>16 个少女、每人 7~8 个 step、693 条任务、16 种 <c>strtype</c>。</item>
 /// </list>
 ///
-/// <para><b>5. ★ 任务进度的实现范围（本轮）</b></para>
-/// 693 条任务分 16 种类型（<c>ReduceItem</c> 308 / <c>FriendLevel</c> 97 / <c>CardCount</c> 56 …），
-/// 逐类埋点是独立的大工程。本轮实现 <b>234「手动点击完成任务」</b>这条**客户端真实会发**的通道：
-/// 玩家在 <c>UI_PromiseTarget</c> 点「完成」，服务端校验并把该任务置为已完成。
-/// 这与原厂交互一致（该命令的中文注释就是「手动点击完成任务」）。
-/// ★ <c>ReduceItem</c> 类型会**真实扣道具**；其余类型按「点击即达成」处理，
-/// 因为它们的进度埋点分散在各玩法里、且客户端不会上报。
+/// <para><b>5. 任务进度的实现范围</b></para>
+/// ReduceItem/ReduceMoney 真实扣除；FriendLevel 按少女好感度等级校验，
+/// CardCount 按对应少女达到强化等级的不同装扮校验，231 同步这两类实际进度。
+/// 送礼、摸头、特训按成功事件累计；看板娘、咖啡馆、休息任务按实际分配计时。
+/// 其余未恢复事件拒绝未达标领取。
 /// </summary>
 public sealed class PledgeFeature : IGameFeature
 {
     /// <summary>231 <c>Pldge_ReqGirls</c>：拥有的誓约少女列表。</summary>
     public const int CmdReqGirls = 231;
+    public const int CmdSetSimpleStep = 228;
 
     /// <summary>232 <c>Pldge_ReqOpenGirls</c>：开放的誓约少女 id 列表。</summary>
     public const int CmdReqOpenGirls = 232;
@@ -90,6 +90,9 @@ public sealed class PledgeFeature : IGameFeature
 
     /// <summary>235 <c>Pldge_StepUpGirl</c>：阶段进阶。</summary>
     public const int CmdStepUpGirl = 235;
+
+    /// <summary>239 第7阶段按已完成任务数领取配置奖励；失败字段为 errid。</summary>
+    public const int CmdGetReward = 239;
 
     /// <summary>存档键（<c>Player.Extra</c>）。</summary>
     public const string ExtraKey = "pledge";
@@ -106,12 +109,12 @@ public sealed class PledgeFeature : IGameFeature
     private GameFeatureContext _ctx = null!;
     private PledgeTable _table = null!;
 
-    public string Name => "誓约（LuaCall 231/232/233/234/235）";
+    public string Name => "誓约（LuaCall 228/231/232/233/234/235/239）";
 
     /// <summary>本模块注册的全部 LuaCall id（供测试与文档校对）。</summary>
     internal static IReadOnlyList<int> HandledCmds { get; } = new[]
     {
-        CmdReqGirls, CmdReqOpenGirls, CmdNewGirl, CmdSetTaskFinish, CmdStepUpGirl,
+        CmdReqGirls, CmdReqOpenGirls, CmdNewGirl, CmdSetTaskFinish, CmdStepUpGirl, CmdSetSimpleStep, CmdGetReward,
     };
 
     public void Install(GameFeatureContext ctx)
@@ -121,10 +124,14 @@ public sealed class PledgeFeature : IGameFeature
 
         // ★ 231 覆盖 MainCityFeature 的空列表实现（那里只回 []，本域接真实数据）
         ctx.MapLuaCall(CmdReqGirls, OnReqGirls);
+        ctx.MapLuaCall(CmdSetSimpleStep, OnSetSimpleStep);
         ctx.MapLuaCall(CmdReqOpenGirls, OnReqOpenGirls);
         ctx.MapLuaCall(CmdNewGirl, OnNewGirl);
         ctx.MapLuaCall(CmdSetTaskFinish, OnSetTaskFinish);
         ctx.MapLuaCall(CmdStepUpGirl, OnStepUpGirl);
+        ctx.MapLuaCall(CmdGetReward, OnGetReward);
+        ctx.OnPlayerPrepare((session, player) =>
+            ctx.PledgeTimes.SaveRefresh(ctx.Store, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
     }
 
     // ================================================================ 232
@@ -164,10 +171,26 @@ public sealed class PledgeFeature : IGameFeature
         if (session.Tag is not Player player)
             return Task.CompletedTask;
 
+        lock (player) return ReqGirlsLocked(session, cmd, player);
+    }
+
+    private Task ReqGirlsLocked(ClientSession session, int cmd, Player player)
+    {
+        try { _ctx.PledgeTimes.SaveRefresh(_ctx.Store, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds()); }
+        catch (Exception error) { Log.Warn($"[pledge] 计时未能保存，返回原有进度：{error.Message}"); }
+
         var state = LoadState(player);
         var arr = new JsonArray();
         foreach (var g in state.Girls.Values.OrderBy(g => g.GirlId))
+        {
+            foreach (var task in g.Tasks.Where(t => t.Status != TaskStatusDone))
+            {
+                var cfg = _table.Task(task.Id);
+                if (cfg is not null && CurrentOwnedCount(player, cfg) is int count)
+                    task.Count = Math.Min(Math.Max(0, cfg.Count), count);
+            }
             arr.Add(BuildGirl(g));
+        }
 
         Log.Info($"[session {session.Id}] Pldge_ReqGirls(231) → 已激活 {state.Girls.Count} 位誓约少女" +
                  (state.Girls.Count > 0
@@ -187,6 +210,16 @@ public sealed class PledgeFeature : IGameFeature
     /// ★ 回**单个少女对象**（<c>GirlPromise.lua:599</c> <c>GirlList[girlID] = tbParam</c>）。
     /// </summary>
     internal Task OnNewGirl(ClientSession session, int cmd, JsonNode? param)
+    {
+        if (session.Tag is not Player player) return Task.CompletedTask;
+        lock (player)
+        {
+            if (!RefreshTimeOrFail(session, cmd, player)) return Task.CompletedTask;
+            return NewGirlLocked(session, cmd, param);
+        }
+    }
+
+    private Task NewGirlLocked(ClientSession session, int cmd, JsonNode? param)
     {
         if (session.Tag is not Player player)
             return Task.CompletedTask;
@@ -213,19 +246,20 @@ public sealed class PledgeFeature : IGameFeature
 
         // 激活消耗 = step0 的第一个任务（实测都是 ReduceItem 誓约碎片 ×10）
         var actTask = _table.ActivateTask(girlId);
-        if (actTask is not null && actTask.StrType == TypeReduceItem && actTask.ReduceGdpl.Count >= 4)
+        if (actTask is null || actTask.GirlId != girlId || actTask.StrType != TypeReduceItem
+            || actTask.ReduceGdpl.Count != 4 || actTask.Count < 0) return Task.CompletedTask;
+        var snapshot = new PledgeMutationSnapshot(player);
+        if (!TryConsume(player, actTask, out var consumed, out string why))
         {
-            if (!TryConsume(session, player, actTask, out string why))
-            {
-                Log.Warn($"[session {session.Id}] Pldge_NewGirl(233) 少女 {girlId} 激活材料不足：{why}，拒绝");
-                return Task.CompletedTask;
-            }
+            Log.Warn($"[session {session.Id}] Pldge_NewGirl(233) 少女 {girlId} 激活材料不足：{why}，拒绝");
+            return Task.CompletedTask;
         }
 
         var girl = new PledgeGirlState { GirlId = girlId, Step = 1 };
         ResetTasks(girl);
         state.Girls[girlId] = girl;
-        SaveState(player, state);
+        if (!TrySaveState(player, state, snapshot)) return Task.CompletedTask;
+        if (consumed.Count > 0) GameNotify.PushItems(session, consumed);
 
         Log.Info($"[session {session.Id}] Pldge_NewGirl(233) 激活誓约少女 {girlId}" +
                  $"（step=1、任务 {girl.Tasks.Count} 条" +
@@ -247,6 +281,16 @@ public sealed class PledgeFeature : IGameFeature
     /// 成功回 <c>{id, count, status}</c>（<c>:614</c> 读 <c>tbParam.id</c>）。
     /// </summary>
     internal Task OnSetTaskFinish(ClientSession session, int cmd, JsonNode? param)
+    {
+        if (session.Tag is not Player player) return Task.CompletedTask;
+        lock (player)
+        {
+            if (!RefreshTimeOrFail(session, cmd, player)) return Task.CompletedTask;
+            return SetTaskFinishLocked(session, cmd, param);
+        }
+    }
+
+    private Task SetTaskFinishLocked(ClientSession session, int cmd, JsonNode? param)
     {
         if (session.Tag is not Player player)
             return Task.CompletedTask;
@@ -279,10 +323,45 @@ public sealed class PledgeFeature : IGameFeature
         }
 
         var cfg = _table.Task(taskId);
-        // ★ 只有 ReduceItem 会真实扣道具；其余类型按「点击即达成」（见类注释 §5）
-        if (cfg is not null && cfg.StrType == TypeReduceItem && cfg.ReduceGdpl.Count >= 4)
+        if (cfg is null || cfg.Count < 0 || cfg.GirlId != girlId
+            || _table.Step(girlId, girl.Step)?.TaskList.Contains(taskId) != true)
         {
-            if (!TryConsume(session, player, cfg, out string why))
+            Fail(session, cmd);
+            return Task.CompletedTask;
+        }
+        if (CurrentOwnedCount(player, cfg) is int owned && owned < cfg.Count)
+        {
+            Fail(session, cmd);
+            return Task.CompletedTask;
+        }
+        // Event/time progress must come from server actions, never from this claim request.
+        if (CurrentOwnedCount(player, cfg) is null
+            && cfg.StrType is not (TypeReduceItem or "ReduceMoney") && task.Count < cfg.Count)
+        {
+            Fail(session, cmd);
+            return Task.CompletedTask;
+        }
+        if (cfg.StrType == TypeReduceItem && cfg.ReduceGdpl.Count != 4)
+        {
+            Fail(session, cmd);
+            return Task.CompletedTask;
+        }
+        var snapshot = new PledgeMutationSnapshot(player);
+        var consumed = new List<Item>();
+        int changedMoney = 0;
+        if (cfg.StrType == "ReduceMoney")
+        {
+            if (!int.TryParse(cfg.Para1, out int moneyId) || moneyId <= 0 || player.GetMoney(moneyId) < cfg.Count)
+            {
+                Fail(session, cmd);
+                return Task.CompletedTask;
+            }
+            player.SetMoney(moneyId, player.GetMoney(moneyId) - cfg.Count);
+            changedMoney = moneyId;
+        }
+        if (cfg.StrType == TypeReduceItem)
+        {
+            if (!TryConsume(player, cfg, out consumed, out string why))
             {
                 Log.Warn($"[session {session.Id}] Pldge_SetTaskFinish(234) 任务 {taskId} 材料不足：{why} → Err");
                 Fail(session, cmd);
@@ -290,9 +369,11 @@ public sealed class PledgeFeature : IGameFeature
             }
         }
 
-        task.Count = cfg?.Count ?? task.Count;
+        task.Count = cfg.Count;
         task.Status = TaskStatusDone;
-        SaveState(player, state);
+        if (!TrySaveState(player, state, snapshot)) { Fail(session, cmd); return Task.CompletedTask; }
+        if (changedMoney > 0) GameNotify.PushMoney(session, player, changedMoney);
+        if (consumed.Count > 0) GameNotify.PushItems(session, consumed);
 
         int done = girl.Tasks.Count(t => t.Status == TaskStatusDone);
         Log.Info($"[session {session.Id}] Pldge_SetTaskFinish(234) 少女 {girlId} 任务 {taskId} " +
@@ -319,10 +400,22 @@ public sealed class PledgeFeature : IGameFeature
     /// </summary>
     internal Task OnStepUpGirl(ClientSession session, int cmd, JsonNode? param)
     {
+        if (session.Tag is not Player player) return Task.CompletedTask;
+        lock (player)
+        {
+            if (!RefreshTimeOrFail(session, cmd, player)) return Task.CompletedTask;
+            return StepUpGirlLocked(session, cmd, param);
+        }
+    }
+
+    private Task StepUpGirlLocked(ClientSession session, int cmd, JsonNode? param)
+    {
         if (session.Tag is not Player player)
             return Task.CompletedTask;
 
         int girlId = ReadInt(param, "girlid");
+        // Simple pledges advance only after their story callback (228), not an empty task list.
+        if (_table.IsSimple(girlId)) { Fail(session, cmd); return Task.CompletedTask; }
         var state = LoadState(player);
         if (!state.Girls.TryGetValue(girlId, out var girl))
         {
@@ -330,8 +423,12 @@ public sealed class PledgeFeature : IGameFeature
             return Task.CompletedTask;
         }
 
-        int unfinished = girl.Tasks.Count(t => t.Status != TaskStatusDone);
-        if (unfinished > 0)
+        var stepCfg = _table.Step(girlId, girl.Step);
+        if (stepCfg is null || girl.Step is < 1 or > 6) return Task.CompletedTask;
+        var required = stepCfg.TaskList.Distinct().ToArray();
+        int unfinished = required.Count(id => !girl.Tasks.Any(t => t.Id == id && t.Status == TaskStatusDone));
+        if (required.Length == 0 || girl.Tasks.Count != required.Length || unfinished > 0
+            || required.Any(id => _table.Task(id)?.GirlId != girlId))
         {
             Log.Warn($"[session {session.Id}] Pldge_StepUpGirl(235) 少女 {girlId} 还有 {unfinished} " +
                      $"条任务未完成（step={girl.Step}），拒绝进阶");
@@ -339,19 +436,40 @@ public sealed class PledgeFeature : IGameFeature
         }
 
         int max = _table.MaxStep(girlId);
-        if (girl.Step >= max)
+        if (girl.Step > max || girl.RewardStep > max)
         {
             Log.Warn($"[session {session.Id}] Pldge_StepUpGirl(235) 少女 {girlId} 已是最高阶段 " +
                      $"{girl.Step}/{max}，拒绝");
             return Task.CompletedTask;
         }
 
+        // Final stage six must still settle its card and story flag even when
+        // this girl has no stage seven. A retry acknowledges the saved settlement.
+        if (girl.RewardStep >= girl.Step)
+        {
+            _ctx.LuaCalls.CallClient(session, cmd, BuildGirl(girl));
+            return Task.CompletedTask;
+        }
         int from = girl.Step;
-        girl.Step++;
-        ResetTasks(girl);
-        SaveState(player, state);
-
-        var stepCfg = _table.Step(girlId, girl.Step);
+        var snapshot = new PledgeMutationSnapshot(player);
+        PledgeCardRewards.Result reward;
+        try
+        {
+            reward = PledgeCardRewards.Apply(_ctx, player, girl, stepCfg);
+            girl.RewardStep = from;
+            if (girl.Step < max) { girl.Step++; ResetTasks(girl); }
+            if (!TrySaveState(player, state, snapshot)) return Task.CompletedTask;
+        }
+        catch (Exception error)
+        {
+            snapshot.Restore(player);
+            Log.Warn($"[pledge] 阶段卡结算失败，保留当前阶段：{error.Message}");
+            return Task.CompletedTask;
+        }
+        if (reward.Removed is not null) GameNotify.PushItemsRemoved(session, [reward.Removed]);
+        if (reward.Rewards.IsEmpty) GameNotify.PushItems(session, reward.Rewards.ChangedItems);
+        else GameNotify.PushRewards(session, player, reward.Rewards);
+        foreach (var formation in reward.Formations) GameNotify.PushFormation(session, formation);
         Log.Info($"[session {session.Id}] Pldge_StepUpGirl(235) 少女 {girlId} 进阶 step {from} → {girl.Step}" +
                  $"（新阶段任务 {girl.Tasks.Count} 条" +
                  (stepCfg is not null && stepCfg.CardGdpl.Count >= 4
@@ -362,7 +480,156 @@ public sealed class PledgeFeature : IGameFeature
         return Task.CompletedTask;
     }
 
+    internal Task OnSetSimpleStep(ClientSession session, int cmd, JsonNode? param)
+    {
+        if (session.Tag is not Player player) return Task.CompletedTask;
+        lock (player)
+        {
+            int girlId = ReadInt(param, "girlId"), wanted = ReadInt(param, "step");
+            var state = LoadState(player);
+            if (!_table.IsSimple(girlId) || !state.Girls.TryGetValue(girlId, out var girl)
+                || !_table.OpenGirlIds(DateTime.Now).Contains(girlId))
+            {
+                Fail(session, cmd);
+                return Task.CompletedTask;
+            }
+            int max = _table.MaxStep(girlId);
+            // The client sends story index + 1: max+1 means all six stories have been read.
+            if (wanted == girl.Step && wanted > 1 && wanted <= max + 1)
+            {
+                _ctx.LuaCalls.CallClient(session, cmd, BuildGirl(girl));
+                return Task.CompletedTask;
+            }
+            if (girl.Step < 1 || girl.Step > max || wanted != girl.Step + 1
+                || string.IsNullOrWhiteSpace(_table.Step(girlId, girl.Step)?.SimpleCartoon))
+            {
+                Fail(session, cmd);
+                return Task.CompletedTask;
+            }
+            var snapshot = new PledgeMutationSnapshot(player);
+            girl.RewardStep = Math.Max(girl.RewardStep, girl.Step);
+            girl.Step = wanted;
+            ResetTasks(girl);
+            if (!TrySaveState(player, state, snapshot)) { Fail(session, cmd); return Task.CompletedTask; }
+            _ctx.LuaCalls.CallClient(session, cmd, BuildGirl(girl));
+        }
+        return Task.CompletedTask;
+    }
+
+    // ================================================================ 239
+
+    internal Task OnGetReward(ClientSession session, int cmd, JsonNode? param)
+    {
+        if (session.Tag is not Player player) return Task.CompletedTask;
+        lock (player)
+        {
+            int girlId = ReadInt(param, "girlid"), step = ReadInt(param, "step");
+            void Reply(int error, int completed = 0, RewardGrantResult? granted = null)
+                => _ctx.LuaCalls.CallClient(session, cmd, new JsonObject
+                {
+                    ["girlid"] = girlId, ["step"] = step, ["errid"] = error,
+                    ["ncompletedtasknum"] = completed,
+                    ["tbaward"] = JsonSerializer.SerializeToNode(granted?.ToAwardTuples() ?? Array.Empty<int[]>()),
+                });
+
+            var state = LoadState(player);
+            var cfg = _table.Step(girlId, step);
+            // Installed rewards belong to the current final stage. Never infer
+            // completion of an unreached stage or of a simple pledge's stories.
+            if (step < 7 || cfg is null || cfg.Rewards.Count == 0 || _table.IsSimple(girlId)
+                || !state.Girls.TryGetValue(girlId, out var girl) || girl.Step != step)
+            {
+                Reply(1);
+                return Task.CompletedTask;
+            }
+            var taskIds = cfg.TaskList.Distinct().ToArray();
+            if (taskIds.Length == 0 || cfg.Rewards.Any(r => r.Length != 6
+                || r.Take(4).Any(v => v <= 0) || r[4] <= 0 || r[5] < 1 || r[5] > taskIds.Length)
+                || taskIds.Any(id => _table.Task(id)?.GirlId != girlId))
+            {
+                Reply(1);
+                return Task.CompletedTask;
+            }
+            int completed = taskIds.Count(id => girl.Tasks.Any(t => t.Id == id && t.Status == TaskStatusDone));
+            int claimed = girl.RewardCount(step);
+            if (claimed < 0 || claimed > taskIds.Length || completed < claimed)
+            {
+                Reply(1);
+                return Task.CompletedTask;
+            }
+            // A lost response may be retried; acknowledge the saved watermark
+            // without granting anything again or lowering the client's watermark.
+            if (completed == claimed)
+            {
+                Reply(0, claimed);
+                return Task.CompletedTask;
+            }
+            var snapshot = new ChallengeMutationSnapshot(player);
+            RewardGrantResult rewards;
+            try
+            {
+                rewards = _ctx.Rewards.Grant(player, cfg.Rewards
+                    .Where(r => r[5] > claimed && r[5] <= completed)
+                    .Select(r => r.Take(5).ToArray()), RewardSource.Extra);
+                girl.SetRewardCount(step, completed);
+                if (completed == taskIds.Length) girl.RewardStep = Math.Max(girl.RewardStep, step);
+                player.Extra[ExtraKey] = state.ToJson();
+                _ctx.Store.SaveRequired(player);
+            }
+            catch (Exception error)
+            {
+                snapshot.Restore(player);
+                Log.Warn($"[pledge] 第7阶段奖励未保存，回滚本次领取：{error.Message}");
+                Reply(1);
+                return Task.CompletedTask;
+            }
+            GameNotify.PushRewards(session, player, rewards);
+            Reply(0, completed, rewards);
+        }
+        return Task.CompletedTask;
+    }
+
     // ================================================================ 内部
+
+    // These are current ownership conditions, not accumulated events; recount does not
+    // discard affection or already owned outfits when entering a new pledge stage.
+    internal static int? CurrentOwnedCount(Player player, PledgeTaskRow cfg)
+    {
+        if (cfg.StrType == "FriendLevel")
+            return (int)Math.Min(int.MaxValue, player.GetGirl((uint)cfg.GirlId)?.Level ?? 0);
+        if (cfg.StrType == "CardCount")
+        {
+            if (!int.TryParse(cfg.Para1, out int minLevel) || minLevel < 0) return 0;
+            return player.Items.Where(i => i.Genre == 1 && i.Detail == cfg.GirlId
+                    && i.Count > 0 && i.EnhanceLevel >= minLevel)
+                .Select(i => (i.Detail, i.Particular, i.Level)).Distinct().Count();
+        }
+        return null;
+    }
+
+    /// <summary>Record only verified successful actions in the current stage; the caller saves atomically with its action.</summary>
+    internal static void RecordAction(PledgeTable table, Player player, int girlId, string type, int amount = 1, int parameter = 0)
+    {
+        if (amount <= 0 || type is not ("TouchHead" or "GiftCount" or "Training")) return;
+        lock (player)
+        {
+            var state = LoadStateStatic(player);
+            if (!state.Girls.TryGetValue(girlId, out var girl)) return;
+            bool changed = false;
+            foreach (var task in girl.Tasks.Where(t => t.Status != TaskStatusDone))
+            {
+                var cfg = table.Task(task.Id);
+                if (cfg is null || cfg.GirlId != girlId || cfg.StrType != type || cfg.Count < 0) continue;
+                if (type == "GiftCount" && (!int.TryParse(cfg.Para1, out int minimum) || parameter < minimum)) continue;
+                if (type == "Training" && (!int.TryParse(cfg.Para1, out int training) || (training != -1 && training != parameter))) continue;
+                // All live action tasks in the final table use recount=1. Do not guess lifetime history.
+                if (cfg.Recount != 1) continue;
+                task.Count = (int)Math.Min(cfg.Count, Math.Max(0L, task.Count) + amount);
+                changed = true;
+            }
+            if (changed) player.Extra[ExtraKey] = state.ToJson();
+        }
+    }
 
     /// <summary>失败回包：<b>只带 <c>Err</c></b>（第八种错误约定，见类注释 §2）。</summary>
     private void Fail(ClientSession session, int cmd)
@@ -389,7 +656,9 @@ public sealed class PledgeFeature : IGameFeature
             ["girlid"] = g.GirlId,
             ["step"] = g.Step,
             ["cardguid"] = g.CardGuid,
+            ["rewardstep"] = g.RewardStep,
             ["taskdatas"] = tasks,
+            ["rewardlist"] = g.BuildRewardList(_table.MaxStep(g.GirlId)),
         };
     }
 
@@ -415,16 +684,20 @@ public sealed class PledgeFeature : IGameFeature
     /// 扣除 <c>ReduceItem</c> 任务要求的材料。成功 true；不足 false 并给出原因。
     /// ★ 扣完要推 <b>pf 1031</b>（不是 1104）让背包界面刷新（AGENTS.md §5）。
     /// </summary>
-    private bool TryConsume(ClientSession session, Player player, PledgeTaskRow cfg, out string why)
+    private static bool TryConsume(Player player, PledgeTaskRow cfg, out List<Item> touched, out string why)
     {
+        touched = new List<Item>();
         why = "";
         var g = cfg.ReduceGdpl;
+        if (g.Count != 4 || g.Any(v => v <= 0)) { why = "消耗配置非法"; return false; }
         uint gg = (uint)g[0], dd = (uint)g[1], pp = (uint)g[2], ll = (uint)g[3];
-        int need = Math.Max(1, cfg.Count);
+        if (cfg.Count < 0) { why = "消耗配置为负数"; return false; }
+        int need = cfg.Count;
+        if (need == 0) return true;
 
-        int have = player.Items
+        long have = player.Items
             .Where(i => i.Genre == gg && i.Detail == dd && i.Particular == pp && i.Level == ll)
-            .Sum(i => (int)i.Count);
+            .Sum(i => (long)i.Count);
         if (have < need)
         {
             why = $"({gg},{dd},{pp},{ll}) 需要 {need}、持有 {have}";
@@ -432,21 +705,18 @@ public sealed class PledgeFeature : IGameFeature
         }
 
         int left = need;
-        var touched = new List<Item>();
         foreach (var it in player.Items
                      .Where(i => i.Genre == gg && i.Detail == dd && i.Particular == pp && i.Level == ll)
                      .ToList())
         {
             if (left <= 0)
                 break;
-            int take = Math.Min(left, (int)it.Count);
+            int take = (int)Math.Min(left, (long)it.Count);
             it.Count -= (uint)take;
             left -= take;
             touched.Add(it);
         }
 
-        if (touched.Count > 0)
-            GameNotify.PushItems(session, touched);
         return true;
     }
 
@@ -470,9 +740,37 @@ public sealed class PledgeFeature : IGameFeature
         return PledgeState.FromJson(node as JsonObject);
     }
 
-    private void SaveState(Player player, PledgeState state)
+    private bool TrySaveState(Player player, PledgeState state, PledgeMutationSnapshot snapshot)
     {
-        player.Extra[ExtraKey] = state.ToJson();
-        _ctx.Store.Save(player);
+        try
+        {
+            player.Extra[ExtraKey] = state.ToJson();
+            _ctx.PledgeTimes.Refresh(player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            _ctx.Store.SaveRequired(player);
+            return true;
+        }
+        catch (Exception error)
+        {
+            snapshot.Restore(player);
+            Log.Warn($"[pledge] 操作未保存，恢复原有材料、任务和阶段卡：{error.Message}");
+            return false;
+        }
+    }
+
+    private bool RefreshTimeOrFail(ClientSession session, int cmd, Player player)
+    {
+        try
+        {
+            _ctx.PledgeTimes.SaveRefresh(_ctx.Store, player, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            return true;
+        }
+        catch (Exception error)
+        {
+            Log.Warn($"[pledge] 计时未保存，拒绝本次任务操作：{error.Message}");
+            // 233's client handler unconditionally indexes girlid; an Err-only
+            // object is not a valid activation response. Preserve its silent rejection.
+            if (cmd != CmdNewGirl) Fail(session, cmd);
+            return false;
+        }
     }
 }

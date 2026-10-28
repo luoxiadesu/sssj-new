@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text;
 using SssjServer.Core;
 using SssjServer.Game.Config;
@@ -55,6 +55,7 @@ public sealed class ServerConsoleFeature : IGameFeature
     public const int PollMilliseconds = 500;
 
     private GameFeatureContext _ctx = null!;
+    private Config.CafeTable _coffeeConditions = Config.CafeTable.Empty;
     private SystemUnlockTable _unlock = SystemUnlockTable.Empty;
 
     public string Name => "服务端 GM 控制台（work/gmsrv.txt）";
@@ -62,6 +63,7 @@ public sealed class ServerConsoleFeature : IGameFeature
     public void Install(GameFeatureContext ctx)
     {
         _ctx = ctx;
+        _coffeeConditions = Config.CafeTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
         _unlock = SystemUnlockTable.Load(Path.GetFullPath(ctx.Options.SettingDirectory));
 
         string path = ctx.Options.ServerGmFile;
@@ -461,6 +463,7 @@ public sealed class ServerConsoleFeature : IGameFeature
                 player.Level = n;
                 player.Exp = 0;
                 Save(player);
+                RefreshCoffeeAfterLevelChange(session, player);
                 GameNotify.PushLevelExp(session, player);
                 Log.Info($"[gmsrv] 等级 → LV.{player.Level}（体力上限 {_ctx.PlayerExp.MaxVigour(player.Level)}）");
                 return true;
@@ -543,6 +546,7 @@ public sealed class ServerConsoleFeature : IGameFeature
                     return Usage("exp <n>");
                 var (gained, lv, exp) = PlayerProgress.AddMasterExp(player, _ctx.PlayerExp, Int(parts[1]));
                 Save(player);
+                RefreshCoffeeAfterLevelChange(session, player);
                 GameNotify.PushLevelExp(session, player);
                 Log.Info($"[gmsrv] 经验 +{Int(parts[1])} → LV.{lv} exp={exp}（升 {gained} 级）");
                 return true;
@@ -742,7 +746,8 @@ public sealed class ServerConsoleFeature : IGameFeature
             GameNotify.PushGirl(session, girl);
 
         if (report.LevelChanged)
-            GameNotify.PushLevelExp(session, player);
+            RefreshCoffeeAfterLevelChange(session, player);
+                GameNotify.PushLevelExp(session, player);
 
         Log.Info($"[gmsrv] {what} 完成：{report.Describe()}");
         Log.Info($"[gmsrv] 当前存量：LV.{player.Level} / 背包 {player.Items.Count} 项 / " +
@@ -828,6 +833,14 @@ public sealed class ServerConsoleFeature : IGameFeature
         if (player.Levels.Count > 40)
             sb.Append($"… 共 {player.Levels.Count} 关");
         return sb.ToString().TrimEnd();
+    }
+
+    private void RefreshCoffeeAfterLevelChange(ClientSession session, Player player)
+    {
+        var changes = CafeBizFeature.RefreshCoffeeConditions(_coffeeConditions, player);
+        if (changes.Count == 0) return;
+        Save(player);
+        GameNotify.PushTaskValues(session, changes);
     }
 
     private void Save(Player player) => _ctx.Store.Save(player);

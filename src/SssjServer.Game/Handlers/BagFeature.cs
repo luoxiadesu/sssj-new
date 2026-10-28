@@ -627,6 +627,8 @@ public sealed class BagFeature : IGameFeature
     /// </summary>
     internal static int CheckSellable(Player player, Item item)
     {
+        if (item.Genre == 1 && item.Guid != 0 && PledgeFeature.LoadStateStatic(player).Girls.Values.Any(g => g.CardGuid == item.Guid))
+            return ErrLocked;
         if (item.LockOn > 0)
             return ErrLocked;
         if (IsEquipped(player, item.Guid))

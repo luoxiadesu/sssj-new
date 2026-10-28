@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using SssjServer.Game.Config;
+using SssjServer.Core;
 using SssjServer.Game.Handlers;
 using Xunit;
 
@@ -20,6 +21,224 @@ public class CafeBizFeatureTests
         var (function, json) = h.LastOutbound;
         Assert.Equal("LuaCall", function);
         return Assert.IsType<JsonObject>(JsonNode.Parse(json))["tbParam"]!;
+    }
+
+    // Production/serving tests start with the requested recipe already learned.
+    // Keep this setup local to production calls so learning tests retain a fresh player.
+    private static Task MakeLearnedCoffeeAsync(FeatureHarness h, string payload)
+    {
+        var body = JsonNode.Parse(payload) as JsonObject;
+        int type = body?["coffeetype"] is JsonValue value && value.TryGetValue<int>(out var parsed) ? parsed : 0;
+        if (type > 0 && type < CafeBizFeature.MaxCoffeeId)
+            h.Player.SetTask(CafeBizFeature.CoffeeTaskGroup, type,
+                h.Player.GetTask(CafeBizFeature.CoffeeTaskGroup, type) | (1 << CafeBizFeature.CoffeeLearnedBit));
+        return h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd, payload);
+    }
+
+    [Theory]
+    [InlineData(9, false)]
+    [InlineData(10, true)]
+    public async Task LearnCoffee_PlayerLevelBoundary(int level, bool allowed)
+    {
+        using var h = await FeatureHarness.CreateAsync("cafe-learn-level");
+        h.Player.Level = level;
+        await h.DispatchLuaCallAsync(CafeBizFeature.LearnCoffeeCmd, "{\"Id\":5}");
+        Assert.Equal(allowed, Learned(h.Player, 5));
+        Assert.Equal(allowed, (h.Player.GetTask(23, 5) & 4) != 0);
+    }
+
+    [Fact]
+    public async Task LearnCoffee_StageRequiresPassCountAndExactDifficulty()
+    {
+        using var h = await FeatureHarness.CreateAsync("cafe-learn-stage");
+        h.Player.Levels[MapList.MapId(4, 12, 1)] = 7; // stars alone are not a pass
+        h.Player.RecordLevelPass(MapList.MapId(4, 12, 2), 7);
+        await h.DispatchLuaCallAsync(CafeBizFeature.LearnCoffeeCmd, "{\"Id\":6}");
+        Assert.False(Learned(h.Player, 6));
+        h.Player.RecordLevelPass(MapList.MapId(4, 12, 1), 7);
+        await h.DispatchLuaCallAsync(CafeBizFeature.LearnCoffeeCmd, "{\"Id\":6}");
+        Assert.True(Learned(h.Player, 6));
+        Assert.Equal(257, h.Player.GetTask(23, 6));
+    }
+
+    [Fact]
+    public async Task ChapterFinishImmediatelyPersistsCoffeeConditionWithoutLearningRequest()
+    {
+        using var h = await FeatureHarness.CreateAsync("coffee-stage-immediate");
+        h.Player.SetTask(23, 6, 256 | 2);
+        await h.DispatchFunctionAsync("ChapterMsg", new JsonObject { ["nState"] = 0, ["Chapter"] = 4, ["Index"] = 12, ["Difficult"] = 1 }.ToJsonString());
+        await h.CompleteChapterAsync(4, 12, 1);
+        Assert.Equal(259, h.Player.GetTask(23, 6));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(259, saved.GetTask(23, 6));
+        Assert.True(await h.WaitForPfAsync(GamePf.TaskValueSyncRsp));
+    }
+
+    [Fact]
+    public async Task GuestSelectionRequiresLearnedRecipeAndPositiveDailyWeight()
+    {
+        using var h = await FeatureHarness.CreateAsync("guest-eligibility");
+        var table = CafeTable.Load(TestPaths.SettingDir);
+        var locked = table.Guests.Values.First(g => g.NeedCoffee > 0);
+        var basic = table.Guests.Values.First(g => g.NeedCoffee == 0);
+        var weights = new List<CafeFeature.CafeGuestWeight>
+            { new(basic.Id, 17), new(locked.Id, 123), new(999999, 50), new(basic.Id, -1) };
+        Assert.Equal(17, Assert.Single(CafeBizFeature.EligibleGuestWeights(table, h.Player, 30, weights)).Weight);
+        h.Player.SetTask(23, locked.NeedCoffee, 7);
+        Assert.Single(CafeBizFeature.EligibleGuestWeights(table, h.Player, 30, weights));
+        h.Player.SetTask(23, locked.NeedCoffee, 256);
+        Assert.Equal(2, CafeBizFeature.EligibleGuestWeights(table, h.Player, 30, weights).Count);
+        Assert.Empty(CafeBizFeature.EligibleGuestWeights(table, h.Player, 0, weights));
+        Assert.Empty(CafeBizFeature.EligibleGuestWeights(table, h.Player, 30, []));
+    }
+
+    [Fact]
+    public async Task DailyGuestsExcludeLockedRecipesAndRepairOldSavedList()
+    {
+        using var h = await FeatureHarness.CreateAsync("daily-guest-filter");
+        var table = CafeTable.Load(TestPaths.SettingDir);
+        var state = new CafeFeature.CafeState(1, 0, 0);
+        int day = CafeFeature.CafeDayIndex(DateTimeOffset.UtcNow);
+        var locked = table.Guests.Values.First(g => g.NeedCoffee > 0);
+        CafeFeature.WriteState(h.Player, state, new CafeFeature.CafeContent
+        {
+            WeightDay = day,
+            Weights = [new CafeFeature.CafeGuestWeight(locked.Id, 123)]
+        });
+        var result = CafeFeature.ReadContent(h.Player, state, table, day);
+        Assert.NotEmpty(result.Weights);
+        Assert.All(result.Weights, w => Assert.Equal(0, table.Guests[w.Id].NeedCoffee));
+        CafeFeature.WriteState(h.Player, state, result);
+        var again = CafeFeature.ReadContent(h.Player, state, table, day);
+        Assert.Equal(result.Weights, again.Weights);
+        foreach (var coffee in table.Coffees.Keys) h.Player.SetTask(23, coffee, 256);
+        var rolled = CafeFeature.RollDailyGuests(table, 30, h.Player.Roleid, day, h.Player);
+        Assert.Contains(rolled, w => table.Guests[w.Id].NeedCoffee > 0);
+    }
+
+    [Fact]
+    public async Task CustomerIdsAreNotReusedAfterQueueAndSeatsEmpty()
+    {
+        using var h = await FeatureHarness.CreateAsync("cafe-guest-sequence");
+        await h.DispatchLuaCallAsync(CafeBizFeature.GenCustomerCmd, "[]");
+        var table = CafeTable.Load(TestPaths.SettingDir);
+        var state = CafeFeature.ReadState(h.Player);
+        int day = CafeFeature.CafeDayIndex(DateTimeOffset.UtcNow);
+        var first = CafeFeature.ReadContent(h.Player, state, table, day).Queue.Single().CustomerIdx;
+        CafeFeature.WriteState(h.Player, state, new CafeFeature.CafeContent());
+        await h.DispatchLuaCallAsync(CafeBizFeature.GenCustomerCmd, "[]");
+        int second = CafeFeature.ReadContent(h.Player, state, table, day).Queue.Single().CustomerIdx;
+        Assert.True(second > first);
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(second, saved.Extra["cafeCustomerSequence"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task RepeatedDrinkSettlementDoesNotGrantOrAccumulateAgain()
+    {
+        var (h, idx) = await SeatedAsync("cafe-repeat-settlement");
+        using var cleanup = h;
+        var payload = $"{{\"customeridx\":{idx}}}";
+        await h.DispatchLuaCallAsync(CafeBizFeature.DrinkOffCoffeeCmd, payload);
+        int gold = h.Player.GetMoney(CafeBizFeature.GoldMoneyId);
+        int coin = h.Player.GetMoney(CafeBizFeature.CoffeeCoinMoneyId);
+        int hot = CafeFeature.ReadState(h.Player).Hot;
+        string report = h.Player.Extra["cafereport"]!.ToJsonString();
+        int replies = h.Outbound.Count;
+        await h.DispatchLuaCallAsync(CafeBizFeature.DrinkOffCoffeeCmd, payload);
+        Assert.Equal(replies, h.Outbound.Count);
+        Assert.Equal(gold, h.Player.GetMoney(CafeBizFeature.GoldMoneyId));
+        Assert.Equal(coin, h.Player.GetMoney(CafeBizFeature.CoffeeCoinMoneyId));
+        Assert.Equal(hot, CafeFeature.ReadState(h.Player).Hot);
+        Assert.Equal(report, h.Player.Extra["cafereport"]!.ToJsonString());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SettlementOverflowLeavesWholeTransactionUnchanged(bool hotOverflow)
+    {
+        var (h, idx) = await SeatedAsync("cafe-settle-overflow");
+        using var cleanup = h;
+        var state = CafeFeature.ReadState(h.Player);
+        if (hotOverflow)
+        {
+            var table = CafeTable.Load(TestPaths.SettingDir);
+            var content = CafeFeature.ReadContent(h.Player, state, table,
+                CafeFeature.CafeDayIndex(DateTimeOffset.UtcNow));
+            CafeFeature.WriteState(h.Player, state with { Hot = int.MaxValue }, content);
+        }
+        else h.Player.AddMoney(CafeBizFeature.GoldMoneyId,
+            int.MaxValue - h.Player.GetMoney(CafeBizFeature.GoldMoneyId));
+        string cafeBefore = h.Player.Extra["cafe"]!.ToJsonString();
+        int goldBefore = h.Player.GetMoney(CafeBizFeature.GoldMoneyId);
+        int coinBefore = h.Player.GetMoney(CafeBizFeature.CoffeeCoinMoneyId);
+        int replies = h.Outbound.Count;
+        await h.DispatchLuaCallAsync(CafeBizFeature.DrinkOffCoffeeCmd,
+            $"{{\"customeridx\":{idx}}}");
+        Assert.Equal(replies, h.Outbound.Count);
+        Assert.Equal(cafeBefore, h.Player.Extra["cafe"]!.ToJsonString());
+        Assert.Equal(goldBefore, h.Player.GetMoney(CafeBizFeature.GoldMoneyId));
+        Assert.Equal(coinBefore, h.Player.GetMoney(CafeBizFeature.CoffeeCoinMoneyId));
+        Assert.False(h.Player.Extra.ContainsKey("cafereport"));
+    }
+
+    [Fact]
+    public async Task CafeDownloadSettlesElapsedSeatExactlyOnce()
+    {
+        var (h, idx) = await SeatedAsync("cafe-offline-seat");
+        using var cleanup = h;
+        int before = h.Player.GetMoney(CafeBizFeature.GoldMoneyId);
+        await h.DispatchLuaCallAsync(CafeFeature.ReqCafeDataCmd, "[]");
+        int after = h.Player.GetMoney(CafeBizFeature.GoldMoneyId);
+        Assert.True(after > before);
+        Assert.Equal(CafeFeature.ReqCafeDataCmd,
+            JsonNode.Parse(h.LastOutbound.Json)!["sCmd"]!.GetValue<int>());
+        await h.DispatchLuaCallAsync(CafeFeature.ReqCafeDataCmd, "[]");
+        Assert.Equal(after, h.Player.GetMoney(CafeBizFeature.GoldMoneyId));
+        await h.DispatchLuaCallAsync(CafeBizFeature.DrinkOffCoffeeCmd,
+            $"{{\"customeridx\":{idx}}}");
+        Assert.Equal(after, h.Player.GetMoney(CafeBizFeature.GoldMoneyId));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.Equal(after, saved.GetMoney(CafeBizFeature.GoldMoneyId));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public async Task DailyEarningsCapClipsPayoutAndStillClearsSeat(int remaining)
+    {
+        var (h, idx) = await SeatedAsync("cafe-daily-limit");
+        using var cleanup = h;
+        h.Player.Extra["cafeDailyEarnings"] = new JsonObject
+        {
+            ["day"] = CafeFeature.CafeDayIndex(DateTimeOffset.UtcNow),
+            ["gold"] = 400000 - remaining, ["coin"] = 200000
+        };
+        int before = h.Player.GetMoney(CafeBizFeature.GoldMoneyId);
+        int coin = h.Player.GetMoney(CafeBizFeature.CoffeeCoinMoneyId);
+        await h.DispatchLuaCallAsync(CafeBizFeature.DrinkOffCoffeeCmd,
+            $"{{\"customeridx\":{idx}}}");
+        Assert.Equal(before + remaining, h.Player.GetMoney(CafeBizFeature.GoldMoneyId));
+        Assert.Equal(coin, h.Player.GetMoney(CafeBizFeature.CoffeeCoinMoneyId));
+        Assert.Equal(400000, h.Player.Extra["cafeDailyEarnings"]!["gold"]!.GetValue<long>());
+        Assert.Equal(0, Assert.IsType<JsonArray>(Payload(h)["earn_base"])[1]!.GetValue<int>());
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public async Task CoffeeCoinCapacityDoesNotDeleteExistingBalance(int remaining)
+    {
+        var (h, idx) = await SeatedAsync("cafe-coin-cap");
+        using var cleanup = h;
+        int max = CafeTable.Load(TestPaths.SettingDir).LevelRowFor(5)!.CoffeeCoinMax;
+        h.Player.AddMoney(CafeBizFeature.CoffeeCoinMoneyId,
+            max - remaining - h.Player.GetMoney(CafeBizFeature.CoffeeCoinMoneyId));
+        await h.DispatchLuaCallAsync(CafeBizFeature.DrinkOffCoffeeCmd,
+            $"{{\"customeridx\":{idx}}}");
+        Assert.Equal(max, h.Player.GetMoney(CafeBizFeature.CoffeeCoinMoneyId));
+        Assert.Equal(remaining, Assert.IsType<JsonArray>(Payload(h)["earn_base"])[1]!.GetValue<int>());
     }
 
     // ================= 111 咖啡馆升级 =================
@@ -278,7 +497,7 @@ public class CafeBizFeatureTests
     /// ★★ 兑换规则**未取证** ⇒ 本实现只回包、**不发奖不扣资源**（见 handler 注释）。
     /// </summary>
     [Fact]
-    public async Task MaxExpReward_回包但不发奖()
+    public async Task MaxExpReward_非法参数不发奖()
     {
         using var h = await FeatureHarness.CreateAsync("cafe-maxexp");
         int itemsBefore = h.Player.Items.Count;
@@ -286,7 +505,7 @@ public class CafeBizFeatureTests
 
         await h.DispatchLuaCallAsync(CafeBizFeature.GetMaxExpRewardCmd, "{}");
 
-        Assert.Equal(n + 1, h.Outbound.Count);                  // ★ 要回包
+        Assert.Equal(n, h.Outbound.Count); // invalid claim produces no success response
         Assert.Equal(itemsBefore, h.Player.Items.Count);        // ★ 不发奖
     }
 
@@ -353,26 +572,27 @@ public class CafeBizFeatureTests
     }
 
     /// <summary>
-    /// ★ 前置咖啡未学 ⇒ 回 <c>nError = 8</c>。
-    /// 咖啡 6 的 <c>Cond1</c> 要求先学 4 号（`CoffeeList.txt`）。
+    /// 关卡条件不能产生虚假的前置咖啡限制。
+    /// 咖啡6要求普通4-12通关，不要求先学习咖啡4。
     /// </summary>
     [Fact]
-    public async Task LearnCoffee_前置未学被拒()
+    public async Task LearnCoffee_不误用关卡号为前置咖啡()
     {
         using var h = await FeatureHarness.CreateAsync("cafe-learn-prereq");
+        h.Player.RecordLevelPass(MapList.MapId(4, 12, 1), 7);
 
         await h.DispatchLuaCallAsync(CafeBizFeature.LearnCoffeeCmd, "{\"Id\":6}");
 
-        Assert.Equal(CafeBizFeature.ErrCoffeePrevNotLearned,
-                     Assert.IsType<JsonObject>(Payload(h))["nError"]!.GetValue<int>());
-        Assert.False(Learned(h.Player, 6));
+        Assert.Null(Assert.IsType<JsonObject>(Payload(h))["nError"]);
+        Assert.True(Learned(h.Player, 6));
     }
 
-    /// <summary>先学前置再学本体 ⇒ 通过（验证前置链真的可解）。</summary>
+    /// <summary>连续学习不同咖啡均保存学习位。</summary>
     [Fact]
-    public async Task LearnCoffee_先学前置后可学()
+    public async Task LearnCoffee_连续学习保存位域()
     {
         using var h = await FeatureHarness.CreateAsync("cafe-learn-chain");
+        h.Player.RecordLevelPass(MapList.MapId(4, 12, 1), 7);
 
         await h.DispatchLuaCallAsync(CafeBizFeature.LearnCoffeeCmd, "{\"Id\":4}");
         await h.DispatchLuaCallAsync(CafeBizFeature.LearnCoffeeCmd, "{\"Id\":6}");
@@ -663,7 +883,7 @@ public class CafeBizFeatureTests
         CafeFeature.WriteState(h.Player, new CafeFeature.CafeState(5, 100, 0));
 
         // ★ 119 的上行是**扁平**的 {coffeetype, count}（不是数组），见 OnMakeCoffee:442
-        await h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd,
+        await MakeLearnedCoffeeAsync(h,
             "{\"coffeetype\":1,\"count\":3}");
         // ★ 座位必须先用 114 造出来 —— ReadContent 对新号不会凭空生成空座位
         //   （字段名 position 且必须 > 0，见 OnUpdateSeatList:312）
@@ -755,7 +975,7 @@ public class CafeBizFeatureTests
     {
         using var h = await FeatureHarness.CreateAsync("cafe-seat-noq");
         CafeFeature.WriteState(h.Player, new CafeFeature.CafeState(5, 0, 0));
-        await h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd,
+        await MakeLearnedCoffeeAsync(h,
             "{\"coffeetype\":1,\"count\":1}");
         await h.DispatchLuaCallAsync(CafeBizFeature.UpdateSeatListCmd,
             "{\"seatlist\":[{\"position\":1}]}");
@@ -1159,6 +1379,93 @@ public class CafeBizFeatureTests
         Assert.Empty(Assert.IsType<JsonArray>(outer[0]!));
     }
 
+    [Fact]
+    public async Task AssignmentsRespectClosedRoomsAndCapacityBeforeReplyAndSave()
+    {
+        using var h = await CafeAsync("cafe-closed-assignment", level: 1);
+        h.Player.Girls.Clear();
+        for (uint id = 1; id <= 4; id++) h.Player.Girls.Add(new Girl { Girlid = id, Modelid = id + 10 });
+        await h.DispatchLuaCallAsync(CafeBizFeature.SetWaiterListCmd,
+            "[[[1,999],[2,999]],[[3,999]],[[4,999]]]");
+        var reply = Assert.IsType<JsonArray>(Payload(h));
+        var cafe = Assert.IsType<JsonArray>(reply[0]);
+        Assert.Single(cafe);
+        Assert.Equal(11, cafe[0]![1]!.GetValue<int>());
+        Assert.Empty(Assert.IsType<JsonArray>(reply[1]));
+        Assert.Empty(Assert.IsType<JsonArray>(reply[2]));
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        var table = CafeTable.Load(TestPaths.SettingDir);
+        var content = CafeFeature.ReadContent(saved, CafeFeature.ReadState(saved, table), table,
+            CafeFeature.CafeDayIndex(DateTimeOffset.UtcNow), 0);
+        Assert.Single(content.AreaGirls[0]);
+        Assert.Empty(content.AreaGirls[1]);
+        Assert.Empty(content.AreaGirls[2]);
+    }
+
+    [Fact]
+    public async Task AssignmentsDeduplicateWithinAndAcrossRoomsAndKeepOpenDorm()
+    {
+        using var h = await CafeAsync("cafe-unique-assignment", level: 30);
+        h.Player.Girls.Clear();
+        for (uint id = 1; id <= 3; id++) h.Player.Girls.Add(new Girl { Girlid = id, Modelid = id });
+        await h.DispatchLuaCallAsync(CafeBizFeature.SetWaiterListCmd,
+            "[[[1,99],[1,99]],[[1,99],[2,99]],[[2,99],[3,99]]]");
+        var reply = Assert.IsType<JsonArray>(Payload(h));
+        for (int i = 0; i < 3; i++)
+        {
+            var area = Assert.IsType<JsonArray>(reply[i]);
+            Assert.Single(area);
+            Assert.Equal(i + 1, area[0]![0]!.GetValue<int>());
+            Assert.Equal(i + 1, area[0]![1]!.GetValue<int>());
+        }
+    }
+
+    [Fact]
+    public async Task ExistingAssignmentsAreNormalizedOnReadIncludingZeroCapacity()
+    {
+        using var h = await CafeAsync("cafe-existing-assignment", level: 1);
+        h.Player.Girls.Clear();
+        h.Player.Girls.Add(new Girl { Girlid = 1, Modelid = 7 });
+        var table = CafeTable.Load(TestPaths.SettingDir);
+        var raw = JsonNode.Parse("[[[1,999],[1,999]],[[1,999]],[[1,999]]]")!.AsArray();
+        var areas = CafeFeature.ReadAreaGirls(raw, h.Player, table.LevelRowFor(1), 0);
+        Assert.Single(areas[0]);
+        Assert.Equal(7, areas[0][0].ModelId);
+        Assert.Empty(areas[1]);
+        Assert.Empty(areas[2]);
+        areas = CafeFeature.ReadAreaGirls(raw, h.Player, table.LevelRowFor(30), 0);
+        Assert.Single(areas[0]);
+        Assert.Empty(areas[1]);
+        Assert.Empty(areas[2]);
+    }
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(30)]
+    public async Task EachAreaIsCappedAtConfiguredSlots(int level)
+    {
+        using var h = await CafeAsync("cafe-assignment-cap", level: level);
+        h.Player.Girls.Clear();
+        var table = CafeTable.Load(TestPaths.SettingDir);
+        var row = table.LevelRowFor(level)!;
+        int[] limits = [row.CafeUnlockNum, row.RestUnlockNum, row.DormUnlockNum];
+        var request = new JsonArray();
+        uint id = 1;
+        for (int area = 0; area < 3; area++)
+        {
+            var slot = new JsonArray();
+            for (int n = 0; n < limits[area] + 1; n++, id++)
+            {
+                h.Player.Girls.Add(new Girl { Girlid = id, Modelid = 1 });
+                slot.Add(new JsonArray((int)id, 999));
+            }
+            request.Add(slot);
+        }
+        await h.DispatchLuaCallAsync(CafeBizFeature.SetWaiterListCmd, request.ToJsonString());
+        var reply = Assert.IsType<JsonArray>(Payload(h));
+        for (int area = 0; area < 3; area++)
+            Assert.Equal(limits[area], reply[area]!.AsArray().Count);
+    }
     // ================= 119 制作咖啡 =================
 
     /// <summary>
@@ -1172,7 +1479,7 @@ public class CafeBizFeatureTests
         var table = SssjServer.Game.Config.CafeTable.Load(TestPaths.SettingDir);
         int type = table.Coffees.Keys.First();
 
-        await h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd,
+        await MakeLearnedCoffeeAsync(h,
                                      $"{{\"coffeetype\":{type},\"count\":3}}");
 
         var p = Assert.IsType<JsonObject>(Payload(h));
@@ -1181,6 +1488,27 @@ public class CafeBizFeatureTests
         var first = Assert.IsType<JsonObject>(list.First());
         Assert.Equal(type, first["coffeetype"]!.GetValue<int>());
         Assert.Equal(3, first["count"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task MakeCoffee_LevelOneRejectsSecondKindWithoutCharging()
+    {
+        using var h = await CafeAsync("cafe-slot-limit", level: 1);
+        await MakeLearnedCoffeeAsync(h, "{\"coffeetype\":1,\"count\":2}");
+        Assert.Null(Assert.IsType<JsonObject>(Payload(h))["nError"]);
+        var beforeMoney = h.Player.GetMoney(CafeBizFeature.GoldMoneyId);
+        await MakeLearnedCoffeeAsync(h, "{\"coffeetype\":2,\"count\":3}");
+        Assert.NotNull(Assert.IsType<JsonObject>(Payload(h))["nError"]);
+        Assert.Equal(beforeMoney, h.Player.GetMoney(CafeBizFeature.GoldMoneyId));
+        var table = SssjServer.Game.Config.CafeTable.Load(TestPaths.SettingDir);
+        var state = CafeFeature.ReadState(h.Player);
+        var content = CafeFeature.ReadContent(h.Player, state, table,
+            CafeFeature.CafeDayIndex(DateTimeOffset.UtcNow));
+        var coffee = Assert.Single(content.Coffees);
+        Assert.Equal(1, coffee.CoffeeType);
+        Assert.Equal(2, coffee.Count);
+        await MakeLearnedCoffeeAsync(h, "{\"coffeetype\":1,\"count\":1}");
+        Assert.Null(Assert.IsType<JsonObject>(Payload(h))["nError"]);
     }
 
     /// <summary>
@@ -1193,7 +1521,7 @@ public class CafeBizFeatureTests
     {
         using var h = await FeatureHarness.CreateAsync("cafebiz-coffee-bad");
 
-        await h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd,
+        await MakeLearnedCoffeeAsync(h,
                                      """{"coffeetype":999999,"count":1}""");
 
         var p = Assert.IsType<JsonObject>(Payload(h));
@@ -1208,8 +1536,8 @@ public class CafeBizFeatureTests
         var table = SssjServer.Game.Config.CafeTable.Load(TestPaths.SettingDir);
         int type = table.Coffees.Keys.First();
 
-        await h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd, $"{{\"coffeetype\":{type},\"count\":2}}");
-        await h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd, $"{{\"coffeetype\":{type},\"count\":5}}");
+        await MakeLearnedCoffeeAsync(h, $"{{\"coffeetype\":{type},\"count\":2}}");
+        await MakeLearnedCoffeeAsync(h, $"{{\"coffeetype\":{type},\"count\":5}}");
 
         var list = Assert.IsType<JsonArray>(Assert.IsType<JsonObject>(Payload(h))["coffeelist"]);
         var only = Assert.IsType<JsonObject>(Assert.Single(list));
@@ -1217,7 +1545,7 @@ public class CafeBizFeatureTests
 
         // 灌满种类上限
         foreach (int t in table.Coffees.Keys.Skip(1).Take(CafeBizFeature.MaxCoffeeKinds + 2))
-            await h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd, $"{{\"coffeetype\":{t},\"count\":1}}");
+            await MakeLearnedCoffeeAsync(h, $"{{\"coffeetype\":{t},\"count\":1}}");
 
         var state = CafeFeature.ReadState(h.Player);
         var content = CafeFeature.ReadContent(h.Player, state, table,
@@ -1241,7 +1569,7 @@ public class CafeBizFeatureTests
         await h.DispatchLuaCallAsync(CafeBizFeature.GenCustomerCmd, json);
         await h.DispatchLuaCallAsync(CafeBizFeature.UpdateSeatListCmd, json);
         await h.DispatchLuaCallAsync(CafeBizFeature.SetWaiterListCmd, json);
-        await h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd, json);
+        await MakeLearnedCoffeeAsync(h, json);
     }
 
     /// <summary>命令号与 `LuaCall.lua:113..119` 的定义一致。</summary>
@@ -1273,9 +1601,9 @@ public class CafeBizFeatureTests
         Assert.True(types.Count == 2, "CoffeeList.txt 至少要有两种咖啡，用例前提不成立");
 
         // 先放两种咖啡进橱窗
-        await h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd,
+        await MakeLearnedCoffeeAsync(h,
                                      $"{{\"coffeetype\":{types[0]},\"count\":3}}");
-        await h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd,
+        await MakeLearnedCoffeeAsync(h,
                                      $"{{\"coffeetype\":{types[1]},\"count\":5}}");
 
         // 清掉第一种
@@ -1304,7 +1632,7 @@ public class CafeBizFeatureTests
         var table = SssjServer.Game.Config.CafeTable.Load(TestPaths.SettingDir);
         int type = table.Coffees.Keys.First();
 
-        await h.DispatchLuaCallAsync(CafeBizFeature.MakeCoffeeCmd,
+        await MakeLearnedCoffeeAsync(h,
                                      $"{{\"coffeetype\":{type},\"count\":1}}");
         await h.DispatchLuaCallAsync(CafeBizFeature.RemoveCoffeeCmd,
                                      $"{{\"coffeetype\":{type}}}");

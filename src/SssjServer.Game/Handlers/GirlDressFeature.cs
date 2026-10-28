@@ -166,6 +166,11 @@ public sealed class GirlDressFeature : IGameFeature
     /// </summary>
     private Task OnSetMainGirl(ClientSession session, Player player, JsonNode? param)
     {
+        lock (player) return SetMainGirlLocked(session, player, param);
+    }
+
+    private Task SetMainGirlLocked(ClientSession session, Player player, JsonNode? param)
+    {
         uint girlId = (uint)ReadInt(param?["nId"]);
 
         if (girlId == 0 || player.GetGirl(girlId) is null)
@@ -177,6 +182,13 @@ public sealed class GirlDressFeature : IGameFeature
             return Task.CompletedTask;
         }
 
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        try { _ctx.PledgeTimes.SaveRefresh(_ctx.Store, player, now); }
+        catch (Exception)
+        {
+            Fail(session, CmdSetMainGirl, ErrGeneric);
+            return Task.CompletedTask;
+        }
         int before = player.GetTask(GmUnlock.MainGirlGroup, GmUnlock.MainGirlTaskId);
         if (before == (int)girlId)
         {
@@ -187,8 +199,19 @@ public sealed class GirlDressFeature : IGameFeature
             return Task.CompletedTask;
         }
 
-        player.SetTask(GmUnlock.MainGirlGroup, GmUnlock.MainGirlTaskId, (int)girlId);
-        _ctx.Store.Save(player);
+        var snapshot = new ChallengeMutationSnapshot(player);
+        try
+        {
+            player.SetTask(GmUnlock.MainGirlGroup, GmUnlock.MainGirlTaskId, (int)girlId);
+            _ctx.PledgeTimes.Refresh(player, now);
+            _ctx.Store.SaveRequired(player);
+        }
+        catch (Exception)
+        {
+            snapshot.Restore(player);
+            Fail(session, CmdSetMainGirl, ErrGeneric);
+            return Task.CompletedTask;
+        }
 
         // ★ 先推数据、再回包（客户端 handler 不收参数、直接重读任务值）
         GameNotify.PushTaskValues(session, new[]
@@ -233,6 +256,16 @@ public sealed class GirlDressFeature : IGameFeature
             return Task.CompletedTask;
         }
 
+        // The client builds its list from exact configured ModelIds, before
+        // consulting permanent ownership. FixModelId is only a storage encoding.
+        if (modelId < 0 || !GmUnlock.IsValidGirlId(girlId)
+            || (!_dress.IsSpineSuit(girlId, modelId)
+                && !_ctx.CharacterCards.ForGirl(girlId).Any(c => c.ModelId == modelId)))
+        {
+            Fail(session, CmdChangeCloth, ErrGeneric);
+            Log.Warn($"[session {session.Id}] GirlLogic/ChangeCloth 少女 {girlId} 无服饰配置 {modelId} → 拒绝换装");
+            return Task.CompletedTask;
+        }
         // ★ 校验「这套衣服拥有吗」：SuitValue > 0
         int suitValue = GetSuitValue(player, girlId, modelId);
         if (suitValue <= SuitNone)
@@ -253,6 +286,17 @@ public sealed class GirlDressFeature : IGameFeature
         if (suitValue == SuitNew)
         {
             SetSuitValue(player, girlId, modelId, SuitWorn, taskUpdates);
+        }
+
+        // Keep the persisted state valid even if the client's follow-up request
+        // is lost: a portrait-only suit cannot enable a nonexistent fight model.
+        if (_dress.IsSpineSuit(girlId, modelId) && !_dress.SuitHasModel(girlId, modelId)
+            && GetVar(player, girlId, VarIsFightModel) != 0)
+        {
+            int group = GirlLoveFeature.VarGroup(girlId);
+            int taskId = GirlLoveFeature.VarTaskId(girlId, VarIsFightModel);
+            player.SetTask(group, taskId, 0);
+            taskUpdates.Add(new(Player.ComposeTaskId(group, taskId), 0));
         }
 
         _ctx.Store.Save(player);
@@ -373,9 +417,20 @@ public sealed class GirlDressFeature : IGameFeature
     /// </summary>
     internal void SyncOwnedSuits(ClientSession session, Player player)
     {
+        bool repairedFightModel = false;
+        foreach (var girl in player.Girls)
+        {
+            int modelId = (int)girl.Modelid;
+            if (!_dress.IsSpineSuit(girl.Girlid, modelId) || _dress.SuitHasModel(girl.Girlid, modelId)
+                || GetVar(player, girl.Girlid, VarIsFightModel) == 0)
+                continue;
+            player.SetTask(GirlLoveFeature.VarGroup(girl.Girlid),
+                GirlLoveFeature.VarTaskId(girl.Girlid, VarIsFightModel), 0);
+            repairedFightModel = true;
+        }
+        if (repairedFightModel) _ctx.Store.Save(player);
+
         int marked = 0;
-        // girlId → 该少女已拥有的服饰 ModelId 集合（用于算 SuitCount）
-        var ownedByGirl = new Dictionary<uint, HashSet<int>>();
 
         void Note(uint girlId, int modelId)
         {
@@ -383,17 +438,13 @@ public sealed class GirlDressFeature : IGameFeature
                 return;
             if (!GmUnlock.IsValidGirlId(girlId))
                 return;
-            if (!ownedByGirl.TryGetValue(girlId, out var set))
-                ownedByGirl[girlId] = set = new HashSet<int>();
-            set.Add(GmUnlock.FixModelId(modelId));
-
             if (GetSuitValue(player, girlId, modelId) != SuitNone)
                 return;     // 已获得（1）或已穿过（2）：不动
             SetSuitValue(player, girlId, modelId, SuitNew, updates: null);
             marked++;
         }
 
-        foreach (var item in player.Items)
+        foreach (var item in player.Items.Where(i => i.Count > 0))
         {
             if (item.Genre == GirlDressTable.SuitItemGenre)
             {
@@ -419,18 +470,23 @@ public sealed class GirlDressFeature : IGameFeature
 
         // SuitCount（group 3 偏移 13）：客户端只用来展示「衣服数」
         int countFixed = 0;
-        foreach (var (girlId, set) in ownedByGirl)
+        foreach (var girl in player.Girls.Where(g => GmUnlock.IsValidGirlId(g.Girlid)))
         {
+            uint girlId = girl.Girlid;
+            // SuitValue is permanent ownership, independent of the source item/card
+            // remaining in the bag. Count each configured outfit once.
+            int count = CountOwnedSuits(_dress, _ctx.CharacterCards, player, girlId);
             int taskId = GirlLoveFeature.VarTaskId(girlId, VarSuitCount);
             int group = GirlLoveFeature.VarGroup(girlId);
-            if (player.GetTask(group, taskId) == set.Count)
+            if (player.GetTask(group, taskId) == count)
                 continue;
-            player.SetTask(group, taskId, set.Count);
+            player.SetTask(group, taskId, count);
             countFixed++;
         }
 
         if (marked > 0 || countFixed > 0)
         {
+            _ctx.Store.Save(player);
             Log.Info($"[session {session.Id}] 换装：新解锁服饰 {marked} 套"
                    + $"（SuitValue 置 {SuitNew} = 已获得未穿过）、修正 SuitCount {countFixed} 个少女"
                    + "；★ 不置位的服饰不会出现在换装列表里（UI_GirlClothes.lua:847）");
@@ -454,7 +510,7 @@ public sealed class GirlDressFeature : IGameFeature
 
         foreach (var item in items)
         {
-            if (item.Genre != GirlDressTable.SuitItemGenre)
+            if (item.Genre != GirlDressTable.SuitItemGenre || item.Count == 0)
                 continue;
             var suit = dress.SuitForItem(item.Genre, item.Detail, item.Particular, item.Level);
             if (suit is null || player.GetGirl(suit.GirlId) is null)
@@ -473,6 +529,42 @@ public sealed class GirlDressFeature : IGameFeature
                    + string.Join('、', granted.Select(t => $"少女{t.Item1} model={t.Item2}")));
         }
         return granted;
+    }
+
+    internal static int CountOwnedSuits(GirlDressTable dress, CharacterCardTable cards, Player player, uint girlId)
+        => cards.ForGirl(girlId).Select(c => c.ModelId)
+            .Concat(dress.All.Where(s => s.GirlId == girlId).Select(s => s.ModelId))
+            .Where(m => m > 0).DistinctBy(GmUnlock.FixModelId)
+            .Count(m => GetSuitValue(player, girlId, m) > 0);
+
+    // Shared by reward paths: source items can unlock once, permanent flags drive count.
+    internal static List<KeyValuePair<uint, int>> SyncRewardSuits(
+        GirlDressTable dress, CharacterCardTable cards, Player player, uint girlId)
+    {
+        var updates = new List<KeyValuePair<uint, int>>();
+        if (player.GetGirl(girlId) is null || !GmUnlock.IsValidGirlId(girlId)) return updates;
+        foreach (var item in player.Items.Where(i => i.Count > 0))
+        {
+            int model = 0;
+            if (item.Genre == CharacterCardTable.CardGenre && item.Detail == girlId)
+                model = cards.Get(item.Genre, item.Detail, item.Particular, item.Level)?.ModelId ?? 0;
+            else if (item.Genre == GirlDressTable.SuitItemGenre)
+            {
+                var suit = dress.SuitForItem(item.Genre, item.Detail, item.Particular, item.Level);
+                if (suit?.GirlId == girlId) model = suit.ModelId;
+            }
+            if (model > 0 && GetSuitValue(player, girlId, model) == SuitNone)
+                SetSuitValue(player, girlId, model, SuitNew, updates);
+        }
+        int group = GirlLoveFeature.VarGroup(girlId);
+        int task = GirlLoveFeature.VarTaskId(girlId, VarSuitCount);
+        int count = CountOwnedSuits(dress, cards, player, girlId);
+        if (player.GetTask(group, task) != count)
+        {
+            player.SetTask(group, task, count);
+            updates.Add(new(Player.ComposeTaskId(group, task), count));
+        }
+        return updates;
     }
 
     // ================= 任务值编码 =================

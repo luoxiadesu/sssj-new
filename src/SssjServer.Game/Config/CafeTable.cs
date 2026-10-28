@@ -1,4 +1,4 @@
-using SssjServer.Core;
+﻿using SssjServer.Core;
 
 namespace SssjServer.Game.Config;
 
@@ -171,10 +171,10 @@ public sealed record CafeCoffeeRow(
     //   现网 1★：AwardA=10 / AwardB=1 / AwardC=1，Rate* 全 0。
     int AwardA, int RateA, int AwardB, int RateB, int AwardC, int RateC,
     int Price, int Cost,
-    // ★ Cond1 原文（`CoffeeList.txt`），格式 `[前置咖啡id-?-?]`。
-    //   现网只有咖啡 6/8/10/12 配了（分别要求 4/5/6/8 号已学）。
-    //   解析见 CafeTable.CoffeePrereq。
-    string Cond1)
+    // Cond1 原文（`CoffeeList.txt`），是关卡条件，不是前置咖啡。
+    //   现网咖啡6/8/10/12配置了章节、关卡、难度条件。
+    //   学习时按真实通关记录校验。
+    string Cond1, int RequiredPlayerLevel = 0)
 {
     /// <summary>按顾客 <c>Prefer</c> 的列名取本咖啡对应的属性值（取证 CoffeeCommon.lua:499）。</summary>
     public int AttrByName(string prefer) => prefer switch
@@ -290,7 +290,7 @@ public sealed record CafeLevelRow(
     //     NeedGold  —— 升级消耗的金币（CafeLogic.lua:471 用 CoffeeCommon.GetCurGold 比）
     int NeedLevel, int NeedHot, int NeedGold,
     // 满级人气兑换用（LuaCall 135 Cafe_GetMaxHotReward）
-    int TotalHot);
+    int TotalHot, int MaxCoffee = 0, int DailyLmtGold = 0, int DailyLmtCoffeeCoin = 0, int CoffeeCoinMax = 0, int OpenTrain = 0);
 
 /// <summary>
 /// 咖啡馆配置表集合（12 张表，全部平铺在 <c>extracted/setting/</c>）：
@@ -635,27 +635,11 @@ public sealed class CafeTable
     /// 而服务端只要不越 1 级的上限就一定安全（1 级是全表最小的一组上限）。
     /// </summary>
     /// <summary>
-    /// 取某杯咖啡的**前置咖啡 id**（学会它之前必须先学会那杯）；没有前置返回 0。
-    ///
-    /// <para>★ 来源是 <c>CoffeeList.txt</c> 的 <c>Cond1</c> 列，格式 <c>[id-?-?]</c>
-    /// （客户端 <c>Parse2Item</c> 解析，`CoffeeCommon.lua:164`）。
-    /// 现网只有 4 杯配了：咖啡 <b>6→4 / 8→5 / 10→6 / 12→8</b>。</para>
-    ///
-    /// ★★ 为什么不用客户端 <c>CheckCanLeanCoffee</c> 里的 <c>PrevCoffee</c> 列：
-    /// **那一列在现网 `CoffeeList.txt` 里不存在**（实测只有 24 列），
-    /// 客户端读它走 <c>or 0</c> 兜底 ⇒ 恒 0 ⇒ 那条检查恒通过。
-    /// 真正有数据的是 <c>Cond1</c>。
+    /// 当前 CoffeeList 未提供 PrevCoffee 列，因此没有前置咖啡限制。
+    /// Cond1 是关卡条件，不能把其中的关卡章节号解释为咖啡编号。
+    /// 与原客户端 CoffeeCommon.lua 对 PrevCoffee 缺失时回落到 0 的行为一致。
     /// </summary>
-    public int CoffeePrereq(int coffeeId)
-    {
-        if (!_coffees.TryGetValue(coffeeId, out var row) || string.IsNullOrEmpty(row.Cond1))
-            return 0;
-        // 形如 "[4-12-1]" ⇒ 取第一段
-        var t = row.Cond1.Trim().Trim('[', ']');
-        int dash = t.IndexOf('-');
-        var head = dash > 0 ? t[..dash] : t;
-        return int.TryParse(head, out int prev) && prev > 0 && prev != coffeeId ? prev : 0;
-    }
+    public int CoffeePrereq(int coffeeId) => 0;
 
     public CafeLevelRow? LevelRowFor(int level)
     {
@@ -929,7 +913,8 @@ public sealed class CafeTable
                     coffees.Int(row, "RateC"),
                     coffees.Int(row, "Price"),
                     coffees.Int(row, "Cost"),
-                    coffees.Str(row, "Cond1") ?? "");
+                    coffees.Str(row, "Cond1") ?? "",
+                    coffees.Int(row, "Cond3"));
             }
         }
 
@@ -961,7 +946,10 @@ public sealed class CafeTable
                     levels.Int(row, "NeedLevel"),
                     levels.Int(row, "NeedHot"),
                     levels.Int(row, "NeedGold"),
-                    levels.Int(row, "TotalHot"));
+                    levels.Int(row, "TotalHot"),
+                    levels.Int(row, "MaxCoffee"),
+                    levels.Int(row, "DailyLmtGold"), levels.Int(row, "DailyLmtCoffeeCoin"),
+                    levels.Int(row, "CoffeeCoinMax"), levels.Int(row, "OpenTrain"));
 
                 // ★ Level=10001 是满级人气兑换的专用行，顺手把它的 LevelAwards 解出来
                 if (level == MaxRewardLevelId)

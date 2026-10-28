@@ -1,4 +1,4 @@
-using System.Reflection;
+﻿using System.Reflection;
 using SssjServer.Core;
 using SssjServer.Game.Config;
 
@@ -19,6 +19,10 @@ public sealed class GameFeatureContext
     private readonly Action<PlayerLoginHook> _onLogin;
     private readonly Action<PlayerLoginHook> _onPrepare;
     private readonly PfRouter _pf;
+    private readonly Lazy<Handlers.PledgeTimeProgress> _pledgeTimes;
+    internal event Action<ClientSession, Player>? BeforeCafeDownload;
+    internal void PrepareCafeDownload(ClientSession session, Player player)
+        => BeforeCafeDownload?.Invoke(session, player);
 
     internal GameFeatureContext(
         ServerOptions options,
@@ -54,11 +58,15 @@ public sealed class GameFeatureContext
         _mapFunction = mapFunction;
         _onLogin = onLogin;
         _onPrepare = onPrepare;
+        _pledgeTimes = new(() => new Handlers.PledgeTimeProgress(
+            PledgeTable.Load(Path.GetFullPath(options.SettingDirectory)),
+            CafeTable.Load(Path.GetFullPath(options.SettingDirectory))));
     }
 
     public ServerOptions Options { get; }
     public PlayerStore Store { get; }
     public World World { get; }
+    internal Handlers.PledgeTimeProgress PledgeTimes => _pledgeTimes.Value;
 
     /// <summary>LuaCall / 字符串命令路由（<c>CallClient</c> / <c>CallClientFunction</c> 用它回包）。</summary>
     public LuaCallRouter LuaCalls { get; }
@@ -169,6 +177,12 @@ public sealed class GameFeatureContext
 /// <paramref name="player"/> 就是 <c>session.Tag</c> 上的那个实例。
 /// </summary>
 public delegate void PlayerLoginHook(ClientSession session, Player player);
+
+/// <summary>Lightweight, per-session maintenance driven by normal player heartbeats.</summary>
+public interface IGamePulseFeature
+{
+    void OnPlayerPulse(ClientSession session, Player player);
+}
 
 /// <summary>
 /// 一个游戏功能域（好友 / 咖啡馆 / 商店 / 任务 …）。实现类放在

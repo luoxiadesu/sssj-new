@@ -1,4 +1,4 @@
-using SssjServer.Core;
+﻿using SssjServer.Core;
 using SssjServer.Protocol.GsProto;
 
 namespace SssjServer.Game;
@@ -312,8 +312,17 @@ public static class GameNotify
     {
         if (granted.IsEmpty)
             return;
+        foreach (var girl in granted.ChangedGirls) PushGirl(session, girl);
         PushMoney(session, player, granted.ChangedMoney);
         PushItems(session, granted.ChangedItems);
+        foreach (uint id in granted.ChangedRiki)
+            session.Push(SssjServer.Protocol.Pf.RikiData, new RikiData { Rikiid = id });
+          if (granted.ChangedFurniture.Count > 0)
+          {
+              var response = new AddFornituresRsp { Roleid = player.Roleid };
+              response.NewFurnitures.AddRange(granted.ChangedFurniture.Select(Handlers.HouseFeature.BuildFurniture));
+              session.Push(SssjServer.Protocol.Pf.AddFornituresRsp, response);
+          }
         if (granted.ChangedTasks.Count > 0)
             PushTaskValues(session, granted.ChangedTasks);
     }
@@ -366,6 +375,10 @@ public static class GameNotify
             Refitnum = it.RefitNum,
         };
 
+        // Character cards match MiniSkill by configured skill ID (AddCharacterCard
+        // 0x1D95A4C..0x1D95D5C), unlike weapon/rune skilltype dispatch.
+        foreach (var s in it.Genre == 1 ? it.Skills : Enumerable.Empty<ItemSkill>())
+            info.Skillinfo.Add(new MiniSkill { Skillid = s.SkillId, Skilllevel = s.SkillLevel, Skilltype = s.SkillType });
         if (!it.IsEquipGenre)
             return info;
 

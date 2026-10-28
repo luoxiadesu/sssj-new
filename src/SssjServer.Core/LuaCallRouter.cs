@@ -39,6 +39,22 @@ public delegate Task<bool> ScriptCoHandler(ClientSession session, string functio
 /// </summary>
 public sealed class LuaCallRouter
 {
+    // Request-local context: settlement acknowledgements must clear the client's
+    // cached mission before dispatching to the ordinary LuaCall consumer.
+    private readonly AsyncLocal<(ClientSession Session, int Command)?> _settlementReply = new();
+
+    public async Task DispatchSettlementAsync(ClientSession session, int command, JsonNode? parameter)
+    {
+        var previous = _settlementReply.Value;
+        _settlementReply.Value = (session, command);
+        try
+        {
+            await DispatchAsync(session, LuaCallFunction,
+                new JsonObject { ["sCmd"] = command, ["tbParam"] = parameter?.DeepClone() }.ToJsonString());
+        }
+        finally { _settlementReply.Value = previous; }
+    }
+
     /// <summary>分片阈值（客户端 LuaCall.ProSize）。</summary>
     public const int ProSize = 64000;
 
@@ -236,6 +252,12 @@ public sealed class LuaCallRouter
     /// </summary>
     public void CallClient(ClientSession session, int cmd, object? param)
     {
+        if (_settlementReply.Value is { } context && ReferenceEquals(context.Session, session) && context.Command == cmd)
+        {
+            param = new { sCmd = cmd, tbParam = param };
+            cmd = 252;
+        }
+
         Task Send(byte[] sJsonParam)
         {
             var sender = NtfS2CCallSender;

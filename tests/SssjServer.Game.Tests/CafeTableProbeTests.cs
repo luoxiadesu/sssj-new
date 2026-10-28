@@ -1,4 +1,4 @@
-using SssjServer.Game.Config;
+﻿using SssjServer.Game.Config;
 using Xunit;
 
 namespace SssjServer.Game.Tests;
@@ -77,17 +77,17 @@ public class CafeTableProbeTests
     }
 
     /// <summary>
-    /// ★ 咖啡前置解析（<c>Cond1</c> 列，格式 <c>[id-?-?]</c>）。
-    /// 现网只有 4 杯配了：**6→4 / 8→5 / 10→6 / 12→8**。
+    /// Cond1 关卡条件不能解释为前置咖啡。
+    /// 原始 Lua 使用独立 PrevCoffee 列；当前资源没有该列。
     /// </summary>
     [Fact]
-    public void 咖啡前置_只有四杯配了()
+    public void 咖啡前置_关卡条件不产生咖啡依赖()
     {
         var t = T;
-        Assert.Equal(4, t.CoffeePrereq(6));
-        Assert.Equal(5, t.CoffeePrereq(8));
-        Assert.Equal(6, t.CoffeePrereq(10));
-        Assert.Equal(8, t.CoffeePrereq(12));
+        Assert.Equal(0, t.CoffeePrereq(6));
+        Assert.Equal(0, t.CoffeePrereq(8));
+        Assert.Equal(0, t.CoffeePrereq(10));
+        Assert.Equal(0, t.CoffeePrereq(12));
 
         // 其余咖啡没有前置
         Assert.Equal(0, t.CoffeePrereq(1));

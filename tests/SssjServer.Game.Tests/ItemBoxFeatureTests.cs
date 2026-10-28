@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+﻿using System.Text.Json.Nodes;
 using SssjServer.Game.Config;
 using SssjServer.Game.Handlers;
 using Xunit;
@@ -22,6 +22,43 @@ namespace SssjServer.Game.Tests;
 /// </summary>
 public class ItemBoxFeatureTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OverflowAffectionBoxUsesOriginalRewardPoolAndHonorsLock(bool locked)
+    {
+        using var h = await FeatureHarness.CreateAsync("overflow-heart-box");
+        h.Player.Items.RemoveAll(x => x.Genre == 8 && x.Detail == 2 && x.Particular == 3 && x.Level == 1);
+        var box = new Item { Guid = 990001, Genre = 8, Detail = 2, Particular = 3, Level = 1,
+            Count = 3, LockOn = locked ? 1u : 0u };
+        h.Player.Items.Add(box);
+        int gold = h.Player.GetMoney(2), diamond = h.Player.GetMoney(3);
+        await h.DispatchLuaCallAsync(76, "{\"gdpln\":[8,2,3,1,3],\"select\":0}");
+        var awards = Assert.IsType<JsonArray>(LastReply(h));
+        if (locked)
+        {
+            Assert.Empty(awards);
+            Assert.Equal(3u, box.Count);
+            Assert.Equal(gold, h.Player.GetMoney(2));
+            Assert.Equal(diamond, h.Player.GetMoney(3));
+            return;
+        }
+        Assert.DoesNotContain(box, h.Player.Items);
+        int goldGain = h.Player.GetMoney(2) - gold, diamondGain = h.Player.GetMoney(3) - diamond;
+        Assert.Equal(0, goldGain % 30000);
+        Assert.Equal(0, diamondGain % 20);
+        Assert.Equal(3, goldGain / 30000 + diamondGain / 20);
+        Assert.NotEmpty(awards);
+        var saved = new PlayerStore(h.Options).Load(h.Player.Account)!;
+        Assert.DoesNotContain(saved.Items, x => x.Guid == box.Guid);
+        Assert.Equal(h.Player.GetMoney(2), saved.GetMoney(2));
+        Assert.Equal(h.Player.GetMoney(3), saved.GetMoney(3));
+        await h.DispatchLuaCallAsync(76, "{\"gdpln\":[8,2,3,1,3],\"select\":0}");
+        Assert.Empty(Assert.IsType<JsonArray>(LastReply(h)));
+        Assert.Equal(gold + goldGain, h.Player.GetMoney(2));
+        Assert.Equal(diamond + diamondGain, h.Player.GetMoney(3));
+    }
+
     private static ItemBoxTable LoadTable() => ItemBoxTable.Load(TestPaths.SettingDir);
 
     /// <summary>取最后一条下行的 <c>tbParam</c>（<c>CallClient</c> 会包一层 <c>{sCmd,tbParam}</c>）。</summary>

@@ -754,15 +754,16 @@ public class HouseFeatureTests
         Assert.Equal(1008u, state.NextObjId);
     }
 
-    /// <summary>存档里家具列表为空（或键缺失）时，按新号重新生成默认摆设。</summary>
+    /// <summary>显式保存的空库存不重新发放默认摆设，实例序号不回退。</summary>
     [Fact]
-    public void 持久化_空列表回落到默认摆设()
+    public void 持久化_显式空列表保持为空()
     {
         var player = NewPlayer();
-        player.Extra["house"] = new JsonObject { ["nextobjid"] = 1000, ["furniturelist"] = new JsonArray() };
+        player.Extra["house"] = new JsonObject { ["nextobjid"] = 2000, ["furniturelist"] = new JsonArray() };
 
         var state = HouseFeature.ReadOrCreate(player, Table);
-        Assert.Equal(13, state.Furniture.Count);
+        Assert.Empty(state.Furniture);
+        Assert.Equal(2000u, state.NextObjId);
     }
 
     /// <summary>没有变化时 <c>WriteState</c> 返回 false（避免每次进店都写一遍存档）。</summary>
@@ -985,6 +986,7 @@ public class CafeHouseDecorTests
     {
         var h = await FeatureHarness.CreateAsync(account);
         h.Player.Level = 300;
+        h.Player.SetMoney(MoneyType.CoffeeCoin, gold);
         h.Player.AddMoney(HouseFeature.GoldMoneyId,
                           gold - h.Player.GetMoney(HouseFeature.GoldMoneyId));
         return h;
@@ -995,7 +997,8 @@ public class CafeHouseDecorTests
     {
         foreach (var th in t.Themes.Values.OrderBy(x => x.Id))
         {
-            if (th.Items.Count == 0)
+            if (th.Items.Count == 0 || th.ThemeType.Length == 0
+                || th.Items.Any(i => !ShopTable.Load(TestPaths.SettingDir).GoodsOf(40001).Any(g => g.GoodsId == i.TemplateId)))
                 continue;
             int price = th.Items.Select(f => t.Furniture.TryGetValue(f.TemplateId, out var r) ? r.SellPrice : 0).Sum();
             if (!needPrice || price > 0)
@@ -1023,7 +1026,7 @@ public class CafeHouseDecorTests
         Assert.Equal(HouseFeature.BuyThemeOk, p.GetValue<string>());
     }
 
-    /// <summary>买主题要把该主题的家具全部入账，并扣金币 + 推 pf 1032。</summary>
+    /// <summary>买主题只补缺件，按商品表扣咖啡币并推 pf 1032。</summary>
     [Fact]
     public async Task BuyTheme_家具入账并扣钱()
     {
@@ -1031,32 +1034,23 @@ public class CafeHouseDecorTests
         var table = CafeTable.Load(TestPaths.SettingDir);
         int themeId = PickTheme(table);
         var theme = table.Themes[themeId];
-        int before = HouseFeature.ReadOrCreate(h.Player, HouseTable.Load(TestPaths.SettingDir)).Furniture.Count;
-        int goldBefore = h.Player.GetMoney(HouseFeature.GoldMoneyId);
+        var initial = HouseFeature.ReadOrCreate(h.Player, HouseTable.Load(TestPaths.SettingDir)).Furniture;
+        int before = initial.Count;
+        int missing = theme.Items.GroupBy(i => i.TemplateId)
+            .Sum(g => Math.Max(0, g.Count() - initial.Count(f => f.TemplateId == g.Key)));
+        int goldBefore = h.Player.GetMoney(MoneyType.CoffeeCoin);
 
         await h.DispatchLuaCallAsync(HouseFeature.BuyThemeCmd, $"{{\"themeid\":{themeId}}}");
 
         int after = HouseFeature.ReadOrCreate(h.Player, HouseTable.Load(TestPaths.SettingDir)).Furniture.Count;
-        Assert.Equal(before + theme.Items.Count, after);
-        Assert.True(h.Player.GetMoney(HouseFeature.GoldMoneyId) < goldBefore, "要扣金币");
+        Assert.Equal(before + missing, after);
+        Assert.True(h.Player.GetMoney(MoneyType.CoffeeCoin) < goldBefore, "要按商品表扣咖啡币");
         Assert.True(await h.WaitForPfAsync(GamePf.MoneyUpdateNtf), "要推 pf 1032");
     }
 
-    /// <summary>
-    /// ★★★ 回归闸：买主题入账的家具必须**照 <c>NCafeThemes.txt</c> 带摆位**。
-    ///
-    /// 这是第十二轮修掉的真 bug —— 早先 <c>OnBuyTheme</c> 写死
-    /// <c>new HouseFurniture(next++, fid, theme.Area, 0, 0, 0, 0, 0, 0)</c>，
-    /// 于是 <c>parentId/posX/posY/rotate</c> 全为 0。<c>parentId=0</c> 的家具在客户端
-    /// 挂不上场景树节点 ⇒ <c>Obj</c> 恒 null ⇒
-    /// <c>NCafeUtilsController.UpdateNavMeshObstacle</c>（RVA <c>0x1808C18</c>）无 nil 保护抛 NRE
-    /// ⇒ <c>LoadSceneTreeItems</c> 回调链断 ⇒ <c>UI.Open('UI_NCafe')</c> 永不执行
-    /// ⇒ **买过主题的号从此进不了咖啡馆**（map 6 卡 40%）。
-    ///
-    /// 判据取「新入账的那批家具」逐件与配置表比对，而不是只看件数。
-    /// </summary>
+    /// <summary>新购缺件只进仓库；现有房间摆位不得被购买主题覆盖。</summary>
     [Fact]
-    public async Task BuyTheme_入账家具必须带摆位_否则进店卡加载条()
+    public async Task BuyTheme_缺件进仓库且不改现有摆位()
     {
         using var h = await RichAsync("house-buy-pose");
         var table = CafeTable.Load(TestPaths.SettingDir);
@@ -1073,24 +1067,15 @@ public class CafeHouseDecorTests
                                 .Furniture.Where(f => !beforeIds.Contains(f.ObjId)).ToList();
         Assert.NotEmpty(added);
 
-        // ★ 核心断言：一件都不许出现 parentId=0（那就是卡加载条的那个值）
-        Assert.All(added, f => Assert.True(
-            f.ParentId > 0,
-            $"家具 objId={f.ObjId} templateId={f.TemplateId} 的 parentId=0 —— " +
-            "客户端会挂不上场景树节点并在 UpdateNavMeshObstacle 抛 NRE、卡在 40% 加载条"));
-
-        // ★ 并且摆位要与配置表逐件一致（按 templateId 分组比对，不依赖顺序）
-        foreach (var group in theme.Items.GroupBy(i => i.TemplateId))
+        // Purchases belong in storage; parent=0 is valid only with room=0.
+        Assert.All(added, f =>
         {
-            var want = group.Select(i => (i.ParentId, i.PosX, i.PosY, i.Rotate)).ToHashSet();
-            var got = added.Where(f => f.TemplateId == group.Key)
-                           .Select(f => (f.ParentId, f.PosX, f.PosY, f.Rotate)).ToHashSet();
-            Assert.True(want.SetEquals(got),
-                        $"templateId={group.Key} 的摆位与 NCafeThemes.txt 不一致：" +
-                        $"表里 [{string.Join(" ", want)}]，入账 [{string.Join(" ", got)}]");
-        }
+            Assert.Equal(0, f.RoomId);
+            Assert.Equal(0u, f.ParentId);
+        });
+        Assert.All(HouseFeature.ReadOrCreate(h.Player, houseTable).Furniture.Where(f => beforeIds.Contains(f.ObjId)),
+            f => Assert.NotEqual(0, f.RoomId));
     }
-
     /// <summary>★ 重复购买 ⇒ **不回包**（本族无失败通道，客户端只认那一个字符串）。</summary>
     [Fact]
     public async Task BuyTheme_重复购买不回包()
@@ -1105,7 +1090,7 @@ public class CafeHouseDecorTests
         Assert.Equal(n, h.Outbound.Count);
     }
 
-    /// <summary>金币不足 ⇒ 不回包、不入账。</summary>
+    /// <summary>商品所需咖啡币不足 ⇒ 不回包、不入账。</summary>
     [Fact]
     public async Task BuyTheme_钱不够不回包()
     {
@@ -1189,7 +1174,9 @@ public class CafeHouseDecorTests
         await h.DispatchLuaCallAsync(HouseFeature.BuyThemeCmd, $"{{\"themeid\":{themeId}}}");
 
         var state = HouseFeature.ReadOrCreate(h.Player, HouseTable.Load(TestPaths.SettingDir));
-        var mine = state.Furniture.Where(f => f.ObjId >= HouseTable.MinPlayerObjId).Take(2).ToList();
+        var mine = state.Furniture.Where(f => f.ObjId >= HouseTable.MinPlayerObjId
+            && (f.RoomId == 0 || f.ParentId == 0)
+            && cafe.Furniture.TryGetValue(f.TemplateId, out var row) && row.SellPrice > 0).Take(2).ToList();
         Assert.NotEmpty(mine);
         int goldBefore = h.Player.GetMoney(HouseFeature.GoldMoneyId);
 
@@ -1199,12 +1186,37 @@ public class CafeHouseDecorTests
         var p = Assert.IsType<JsonObject>(Param(h));
         var arr = Assert.IsType<JsonArray>(p["objIds"]);
         Assert.Equal(mine.Count, arr.Count);
-        Assert.True(h.Player.GetMoney(HouseFeature.GoldMoneyId) >= goldBefore, "卖了要进账");
+        Assert.Equal(goldBefore + mine.Sum(f => cafe.Furniture[f.TemplateId].SellPrice),
+            h.Player.GetMoney(HouseFeature.GoldMoneyId));
 
         // 家具真的没了
         var after = HouseFeature.ReadOrCreate(h.Player, HouseTable.Load(TestPaths.SettingDir));
         foreach (var f in mine)
             Assert.DoesNotContain(after.Furniture, x => x.ObjId == f.ObjId);
+    }
+
+    [Theory]
+    [InlineData(1, 2, false)] // 已摆放
+    [InlineData(0, 0, true)] // 金币已满
+    public async Task SellFur_不可出售时库存和金币不变(int room, uint parent, bool fullMoney)
+    {
+        using var h = await RichAsync($"house-sell-guard-{room}-{fullMoney}");
+        var table = HouseTable.Load(TestPaths.SettingDir);
+        var cafe = CafeTable.Load(TestPaths.SettingDir);
+        int template = cafe.Furniture.Values.First(f => f.SellPrice > 0 && table.Items.ContainsKey(f.Id)).Id;
+        var furniture = new HouseFurniture(1000, template, room, parent, 0, 0, 0, 1, 0);
+        HouseFeature.WriteState(h.Player, new HouseState
+        {
+            Furniture = new List<HouseFurniture> { furniture }, NextObjId = 1001
+        });
+        if (fullMoney) h.Player.SetMoney(HouseFeature.GoldMoneyId, int.MaxValue);
+        int before = h.Player.GetMoney(HouseFeature.GoldMoneyId);
+
+        await h.DispatchLuaCallAsync(HouseFeature.SellFurCmd, "{\"objIds\":[1000,1000]}");
+
+        Assert.Empty(Assert.IsType<JsonArray>(Param(h)!["objIds"]));
+        Assert.Equal(before, h.Player.GetMoney(HouseFeature.GoldMoneyId));
+        Assert.Equal(furniture, Assert.Single(HouseFeature.ReadOrCreate(h.Player, table).Furniture));
     }
 
     /// <summary>★ 系统家具（objId &lt; 1000）不能被卖 —— 回空清单。</summary>
@@ -1577,6 +1589,22 @@ public class CafeVisitGirlTests
 /// </summary>
 public class MusicSceneGrantTests
 {
+    [Fact]
+    public async Task ExistingOutdoorIsPreservedAndMusicGrantGoesToStorage()
+    {
+        using var h = await GmAsync("music-scene-preserve-outdoor");
+        var outdoor = new HouseFurniture(1000, 1000, 5, 22, 0, 0, 0, 0, 0);
+        HouseFeature.WriteState(h.Player, new HouseState { Furniture = [outdoor], NextObjId = 1001 });
+        h.RunPrepareHooks();
+        h.RunPrepareHooks();
+        var state = HouseFeature.ReadOrCreate(h.Player, Table);
+        Assert.Equal(outdoor, state.Furniture[0]);
+        var music = Assert.Single(state.Furniture, f => f.TemplateId == HouseFeature.MusicSceneTemplateId);
+        Assert.Equal(0, music.RoomId);
+        Assert.Equal(0u, music.ParentId);
+        Assert.Equal(1000, GirlTrainFeature.CurrentOutdoor(h.Player, Table));
+    }
+
     private static HouseTable Table => HouseTable.Load(TestPaths.SettingDir);
 
     /// <summary>

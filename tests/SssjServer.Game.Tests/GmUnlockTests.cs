@@ -70,11 +70,11 @@ public class GmUnlockTests
     /// 转成三行表头格式。这条测试保证「表还在、还是那 269 张」。
     /// </summary>
     [Fact]
-    public void CharacterCardTable_Has269Cards_AllGenre1()
+    public void CharacterCardTable_Current295Cards_AllGenre1()
     {
         var table = CharacterCardTable.Load(TestPaths.SettingDir);
 
-        Assert.Equal(269, table.Count);
+        Assert.Equal(295, table.Count);
         Assert.All(table.All, c => Assert.Equal(CharacterCardTable.CardGenre, c.G));
 
         // 抽样与 CardRefit.txt 交叉核对（该表第 4 行 G=1 D=2 P=1 L=3 备注「私服·高奈利亚」）
@@ -101,7 +101,7 @@ public class GmUnlockTests
     /// 漏了会让 group 4 的衣服标记写到与客户端不同的键上（静默失败）。
     /// </summary>
     [Fact]
-    public void CharacterCard_ModelIdIsSuitId_WithThreeSkinExceptions()
+    public void CharacterCard_ModelIdIsSuitId_WithFourSkinExceptions()
     {
         var table = CharacterCardTable.Load(TestPaths.SettingDir);
 
@@ -109,13 +109,14 @@ public class GmUnlockTests
                                  .GroupBy(c => ((int)c.P, c.ModelId))
                                  .ToDictionary(g => g.Key, g => g.Count());
 
-        Assert.Equal(3, exceptions.Count);
-        Assert.Equal(11, exceptions[(71, 7001)]);
-        Assert.Equal(13, exceptions[(81, 8001)]);
-        Assert.Equal(3, exceptions[(82, 8002)]);
+        Assert.Equal(4, exceptions.Count);
+        Assert.Equal(14, exceptions[(71, 7001)]);
+        Assert.Equal(14, exceptions[(81, 8001)]);
+        Assert.Equal(4, exceptions[(82, 8002)]);
+        Assert.Equal(2, exceptions[(72, 7002)]);
 
-        // 其余 242 张 ModelId == P
-        Assert.Equal(269 - 11 - 13 - 3, table.All.Count(c => c.ModelId == (int)c.P));
+        // 当前配置其余卡片 ModelId == P
+        Assert.Equal(295 - 14 - 14 - 4 - 2, table.All.Count(c => c.ModelId == (int)c.P));
 
         // 这三个例外过 FixModelId 之后都落到 < 2000 的合法偏移
         Assert.Equal(1711, GmUnlock.FixModelId(7001));
@@ -137,7 +138,7 @@ public class GmUnlockTests
 
         Assert.Single(invalid);
         Assert.Equal(102u, invalid[0].D);
-        Assert.Equal(16, table.GirlIds.Count(GmUnlock.IsValidGirlId));
+        Assert.Equal(20, table.GirlIds.Count(GmUnlock.IsValidGirlId));
     }
 
     [Theory]
@@ -167,6 +168,21 @@ public class GmUnlockTests
     public void FixModelId_MatchesLua(int input, int expected)
         => Assert.Equal(expected, GmUnlock.FixModelId(input));
 
+    [Fact]
+    public void LinkGirlFlagsUseExtendedGroupsWithoutOverwritingNormalGirl()
+    {
+        var gm = Create(); var player = NewPlayer(); gm.ApplyCards(player);
+        Assert.Equal(1, GmUnlock.GirlTaskId(201, 1));
+        Assert.Equal(3, GmUnlock.GirlTaskGroup(3, 1));
+        Assert.Equal(90, GmUnlock.GirlTaskGroup(3, 201));
+        Assert.Equal(91, GmUnlock.GirlTaskGroup(4, 201));
+        Assert.Equal(92, GmUnlock.GirlTaskGroup(7, 201));
+        Assert.Equal(1, player.GetTask(90, GmUnlock.GirlVarIsEndShow));
+        Assert.Equal(1, player.GetTask(3, GmUnlock.GirlVarIsEndShow));
+        Assert.Equal(GmUnlock.OwnedNotNew, player.GetTask(91, 1));
+        Assert.Equal(GmUnlock.OwnedNotNew, player.GetTask(92, 24));
+    }
+
     // ================= 全角色卡 =================
 
     [Fact]
@@ -178,7 +194,7 @@ public class GmUnlockTests
         var report = gm.ApplyCards(player);
 
         int expectedCards = cards.All.Count(c => GmUnlock.IsValidGirlId(c.D));
-        Assert.Equal(268, expectedCards);                       // 269 - 1 张 Detail=102
+        Assert.Equal(294, expectedCards);                       // 295 - 1 张 Detail=102
         Assert.Equal(expectedCards, report.NewCards);
         Assert.Equal(expectedCards, player.Items.Count);
         Assert.All(player.Items, it => Assert.Equal(CharacterCardTable.CardGenre, it.Genre));
@@ -187,8 +203,8 @@ public class GmUnlockTests
         Assert.All(player.Items, it => Assert.Equal(1u, it.Count));
         Assert.Equal(expectedCards, player.Items.Select(i => i.Guid).Distinct().Count());
 
-        // 16 位少女，且没有 Detail=102
-        Assert.Equal(16, player.Girls.Count);
+        // 当前卡表20位有效少女，含联动少女，且没有Detail=102
+        Assert.Equal(20, player.Girls.Count);
         Assert.DoesNotContain(102u, player.Girls.Select(g => g.Girlid));
         Assert.All(player.Girls, g => Assert.True(GmUnlock.IsValidGirlId(g.Girlid)));
     }
@@ -254,7 +270,7 @@ public class GmUnlockTests
         foreach (var c in cards.All.Where(c => GmUnlock.IsValidGirlId(c.D)))
         {
             int t = GmUnlock.GirlTaskId(c.D, (int)(c.P * GmUnlock.CardPStride + c.L));
-            Assert.Equal(GmUnlock.OwnedNotNew, player.GetTask(GmUnlock.CardGroup, t));
+            Assert.Equal(GmUnlock.OwnedNotNew, player.GetTask(GmUnlock.GirlTaskGroup(GmUnlock.CardGroup, c.D), t));
         }
     }
 
@@ -294,11 +310,11 @@ public class GmUnlockTests
 
         foreach (uint girlId in cards.GirlIds.Where(GmUnlock.IsValidGirlId))
         {
-            Assert.Equal(1, player.GetTask(GmUnlock.GirlVarGroup,
+            Assert.Equal(1, player.GetTask(GmUnlock.GirlTaskGroup(GmUnlock.GirlVarGroup, girlId),
                 GmUnlock.GirlTaskId(girlId, GmUnlock.GirlVarIsEndShow)));
 
             int suits = cards.ForGirl(girlId).Select(c => GmUnlock.FixModelId(c.ModelId)).Distinct().Count();
-            Assert.Equal(suits, player.GetTask(GmUnlock.GirlVarGroup,
+            Assert.Equal(suits, player.GetTask(GmUnlock.GirlTaskGroup(GmUnlock.GirlVarGroup, girlId),
                 GmUnlock.GirlTaskId(girlId, GmUnlock.GirlVarSuitCount)));
         }
     }
@@ -371,9 +387,10 @@ public class GmUnlockTests
         // ★ 不要钉具体数量：`MissingIcon.txt` 是 `tools/probe_icons.sh` 的**真机产出**，
         // 会随设备资源状态变化。实测推了正确的 `version.data` 之后，缺失图标
         // 从 125 张降到 23 张（受影响道具 136 → 25，见 `docs/05` §10.1.1）——
-        // 那次把这条断言从 `> 100` 打挂了。这里只断言「表确实被载入并生效了」。
-        Assert.True(skipped > 0, $"图标缺失清单一条都没跳过（skipped={skipped}），MissingIcon.txt 可能没载入");
-        Assert.Equal(missing.Count > 0, skipped > 0);
+        // 当前允许空清单：不因没有待排除图标而改变既有全道具发放筛选。
+        // 上方数量等式已校验真实命中项均被排除；清单还可能含不在物品表中的图标。
+        Assert.DoesNotContain(player.Items, item => items.Get(item.Genre, item.Detail, item.Particular, item.Level)
+            is { } template && missing.IsMissing(template.IconId));
     }
 
     /// <summary>
@@ -592,7 +609,7 @@ public class GmUnlockTests
 
         Assert.Equal(GmUnlock.Revision, GmUnlock.RevisionOf(player));
         Assert.True(player.Items.Count > 2000, $"背包只有 {player.Items.Count} 项");
-        Assert.Equal(16, player.Girls.Count);
+        Assert.Equal(20, player.Girls.Count);
         Assert.Equal(h.Module.Chapters.Count, player.Levels.Count);
         Assert.True(player.Tasks.Count > 3000, $"任务值只有 {player.Tasks.Count} 条");
         Assert.Equal(h.Options.GmMoneyAmount, player.GetMoney(MoneyType.Gold));
@@ -649,12 +666,12 @@ public class GmUnlockTests
             Payload = new Protocol.GsProto.LoginReq { Account = "", Channel = "selftest" }.ToByteArray(),
         };
 
-        await h.Module.HandleLogin(new SessionAdapter(h.Session), packet);
+        await h.DrainWhileAsync(() => h.Module.HandleLogin(new SessionAdapter(h.Session), packet));
         var first = Assert.IsType<Player>(h.Session.Tag);
         int items = first.Items.Count;
         uint nextGuid = first.NextGuid;
 
-        await h.Module.HandleLogin(new SessionAdapter(h.Session), packet);
+        await h.DrainWhileAsync(() => h.Module.HandleLogin(new SessionAdapter(h.Session), packet));
         var second = Assert.IsType<Player>(h.Session.Tag);
 
         Assert.Equal(items, second.Items.Count);
@@ -885,18 +902,12 @@ public class GmUnlockTests
     {
         var table = MissingIconTable.Load(TestPaths.SettingDir);
 
-        // ★ 不钉具体条数（真机产出，会变；见上面 ApplyItems 那条注释与 `docs/05` §10.1.1）。
-        Assert.True(table.Count > 0, $"MissingIcon.txt 一条都没读到（{table.Count}）");
-
-        // 用**当前**清单里真实存在的第一条做正例，避免把某个具体图标名钉死 ——
-        // `icon_weapon_part_add` / `icon_weapon_part_rewrite` 曾经是这里的正例，
-        // 但推了正确的 `version.data` 之后它们**已经能正常加载、不在清单里了**。
-        string sample = System.IO.File.ReadAllLines(
-                System.IO.Path.Combine(TestPaths.SettingDir, "MissingIcon.txt"))
-            .Skip(3)                                  // 3 行表头
-            .Select(l => l.Split('\t')[0].Trim())
-            .First(l => l.Length > 0);
-        Assert.True(table.IsMissing(sample), $"清单里的 {sample} 应被判为缺失");
+        // The optional snapshot can be absent or empty after resource restoration.
+        string path = Path.Combine(TestPaths.SettingDir, MissingIconTable.FileName);
+        string[] expected = File.Exists(path) ? File.ReadAllLines(path).Skip(3)
+            .Select(l => l.Split('\t')[0].Trim()).Where(l => l.Length > 0).Distinct().ToArray() : Array.Empty<string>();
+        Assert.Equal(expected.OrderBy(v => v), table.All.OrderBy(v => v));
+        Assert.All(expected, sample => Assert.True(table.IsMissing(sample)));
         // 同图集里正常的那些不能被误判
         Assert.False(table.IsMissing("Item/icon_sync_item_002.png"));
         Assert.False(table.IsMissing("Item/icon_curr_coin.png"));
@@ -935,21 +946,26 @@ public class GmUnlockTests
     [Fact]
     public void ApplyItems_RemovesLegacyMissingIconItems()
     {
-        var gm = Create(out _, out _, out _, out var items, out _);
+        _ = Create(out var options, out var cards, out var chapters, out var items, out var missions,
+            out var guides, out var playerExp);
         var player = NewPlayer();
-
-        // 造一条 rev2 时代发下去的「问号道具」
-        var missing = MissingIconTable.Load(TestPaths.SettingDir);
-        var victim = items.All.First(t => missing.IsMissing(t.IconId)
-                                      && !items.TryGetMoneyId(t.G, t.D, t.P, t.L, out _));
-        var stale = player.AddItem(victim.G, victim.D, victim.P, victim.L, count: 999);
-
-        var report = gm.ApplyItems(player);
-
-        Assert.DoesNotContain(player.Items, i => i.Guid == stale.Guid);
-        Assert.Contains(stale, report.RemovedItems);
-        Assert.DoesNotContain(stale, report.ChangedItems);
-        Assert.False(report.IsEmpty);
+        // An isolated snapshot exercises cleanup even when the installed optional table is absent.
+        var victim = items.All.First(t => !string.IsNullOrWhiteSpace(t.IconId)
+            && !items.TryGetMoneyId(t.G, t.D, t.P, t.L, out _));
+        string directory = Path.Combine(Path.GetTempPath(), "sssj-missing-icon-test", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            File.WriteAllText(Path.Combine(directory, MissingIconTable.FileName), "STR\n图标\nIconId\n" + victim.IconId + "\n");
+            var gm = new GmUnlock(options, chapters, items, cards, missions, guides, playerExp, MissingIconTable.Load(directory));
+            var stale = player.AddItem(victim.G, victim.D, victim.P, victim.L, count: 999);
+            var report = gm.ApplyItems(player);
+            Assert.DoesNotContain(player.Items, i => i.Guid == stale.Guid);
+            Assert.Contains(stale, report.RemovedItems);
+            Assert.DoesNotContain(stale, report.ChangedItems);
+            Assert.False(report.IsEmpty);
+        }
+        finally { Directory.Delete(directory, recursive: true); }
     }
 
     /// <summary>关掉开关就拿回「真·全道具」（代价是那批问号格子）。</summary>
